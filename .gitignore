@@ -1,0 +1,14 @@
+# 编译产物与本地文件（不入库）
+RayRadar.exe
+PawnIO_setup.exe
+lib/
+*.bak
+*.bak-*
+*.obj
+bin/
+obj/
+.vs/
+
+# 截图以外的临时文件
+*.log
+*.user
