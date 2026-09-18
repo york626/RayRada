@@ -15,7 +15,10 @@ Get-Process RayRadar -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorA
 Start-Sleep -Seconds 1
 if (Get-Process RayRadar -ErrorAction SilentlyContinue) {
   # 兜底 1：taskkill（对同用户的提权进程通常有效）
-  & taskkill.exe /F /IM RayRadar.exe 2>$null | Out-Null
+  # 注意：原生命令往 stderr 写内容，在 $ErrorActionPreference='Stop' 下会变成终止性错误，所以这里临时放开
+  $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'SilentlyContinue'
+  & taskkill.exe /F /IM RayRadar.exe | Out-Null
+  $ErrorActionPreference = $prevEap
   Start-Sleep -Seconds 2
 }
 if (Get-Process RayRadar -ErrorAction SilentlyContinue) {

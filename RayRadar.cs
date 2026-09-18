@@ -516,6 +516,7 @@ namespace RayRadar
         int topTick = 0;
         TempFlyout flyout;
         Point downPt; bool downLeft = false;
+        bool suppressClick = false;          // 双击后抑制紧随的 MouseUp
         int flushTick = 0;
 
         public RadarForm(Settings s)
@@ -727,13 +728,24 @@ namespace RayRadar
             bool wasDrag = dragging;
             dragging = false;
             bool isClick = downLeft && Math.Abs(e.X - downPt.X) <= 4 && Math.Abs(e.Y - downPt.Y) <= 4;
-            if (isClick) { HandleClick(e.X); return; }        // 纯点击：区分「点网速看流量」「点主温度展开」
+            if (isClick)
+            {
+                if (suppressClick) { suppressClick = false; return; }   // 刚发生双击：这次抬起不算单击
+                HandleClick(e.X); return;                                // 纯点击：区分「点网速看流量」「点主温度展开」
+            }
+            suppressClick = false;
             if (!wasDrag) return;
             SnapToEdges(); st.X = Location.X; st.Y = Location.Y; st.Save(); ApplyDock();
             if (flyout != null && flyout.Visible) PositionFlyout();
         }
-        // 双击不再打开设置窗口（用户 2026-09-18 要求：只有右键打开设置）；双击时顺手收起温度浮层
-        protected override void OnMouseDoubleClick(MouseEventArgs e) { base.OnMouseDoubleClick(e); HideFlyout(); }
+        // 双击不再打开设置窗口（用户 2026-09-18 要求：只有右键打开设置）；
+        // 双击时收起温度浮层，并抑制紧随其后的那次 MouseUp，避免被当成单击又把它打开
+        protected override void OnMouseDoubleClick(MouseEventArgs e)
+        {
+            base.OnMouseDoubleClick(e);
+            suppressClick = true;
+            HideFlyout();
+        }
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); if (collapsed) { Bounds = expandBounds; collapsed = false; } }
 
         void ClampToWorkArea()
