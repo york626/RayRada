@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -869,6 +869,8 @@ namespace RayRadar
     public class SettingsForm : Form
     {
         Settings st; RadarForm owner;
+        Panel scroll;
+
         public SettingsForm(Settings s, RadarForm o)
         {
             st = s; owner = o;
@@ -876,13 +878,22 @@ namespace RayRadar
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(420, 840);
+            ClientSize = new Size(420, 560);
             Font = new Font("Microsoft YaHei UI", 9f);
-            int y = 14;
 
+            // 内容区：可滚动（内容比窗口高时自动出现滚动条，鼠标滚轮也能滚）
+            scroll = new Panel();
+            scroll.Location = new Point(0, 0);
+            scroll.Size = new Size(420, 506);
+            scroll.AutoScroll = true;
+            scroll.BackColor = SystemColors.Control;
+            Controls.Add(scroll);
+
+            int y = 12;
             y = Toggle("始终置顶显示", y, st.TopMost, delegate(bool v) { st.TopMost = v; owner.ApplySettings(); });
-            y = Toggle("锁定浮窗位置", y, st.LockPos, delegate(bool v) { st.LockPos = v; });
-            y = Toggle("贴边时收起", y, st.DockCollapse, delegate(bool v) { st.DockCollapse = v; });
+            Toggle2("锁定浮窗位置", 18, y, st.LockPos, delegate(bool v) { st.LockPos = v; });
+            Toggle2("贴边时收起", 210, y, st.DockCollapse, delegate(bool v) { st.DockCollapse = v; });
+            y += 30;
 
             Lbl("浮窗样式", 18, y + 6);
             for (int i = 0; i < Skins.Sets.Length; i++)
@@ -895,73 +906,73 @@ namespace RayRadar
                 sw.Click += delegate
                 {
                     st.Skin = idx;
-                    foreach (Control c in Controls) { Panel p = c as Panel; if (p != null && p.Tag != null && (string)p.Tag == "skin") p.BorderStyle = BorderStyle.FixedSingle; }
+                    foreach (Control c in scroll.Controls) { Panel p = c as Panel; if (p != null && p.Tag != null && (string)p.Tag == "skin") p.BorderStyle = BorderStyle.FixedSingle; }
                     sw.BorderStyle = BorderStyle.Fixed3D; owner.ApplySettings();
                 };
-                Controls.Add(sw);
+                scroll.Controls.Add(sw);
             }
-            y += 32;
+            y += 28;
 
             Lbl("文字颜色", 18, y + 6);
             CheckBox cbB = new CheckBox(); cbB.Text = "黑"; cbB.Location = new Point(180, y + 3); cbB.AutoSize = true; cbB.Checked = st.TextBlack;
             CheckBox cbW = new CheckBox(); cbW.Text = "白"; cbW.Location = new Point(240, y + 3); cbW.AutoSize = true; cbW.Checked = !st.TextBlack;
             cbB.CheckedChanged += delegate { if (cbB.Checked) { cbW.Checked = false; st.TextBlack = true; owner.ApplySettings(); } };
             cbW.CheckedChanged += delegate { if (cbW.Checked) { cbB.Checked = false; st.TextBlack = false; owner.ApplySettings(); } };
-            Controls.Add(cbB); Controls.Add(cbW);
-            y += 32;
+            scroll.Controls.Add(cbB); scroll.Controls.Add(cbW);
+            y += 28;
 
-            Lbl("透明度调节", 18, y + 6);
+            Lbl("透明度调节", 18, y + 8);
             TrackBar tb = new TrackBar();
             tb.Minimum = 30; tb.Maximum = 100; tb.TickFrequency = 10; tb.Value = st.Opacity;
-            tb.Location = new Point(170, y - 6); tb.Width = 220;
+            tb.Location = new Point(170, y); tb.Width = 220;
             tb.ValueChanged += delegate { st.Opacity = tb.Value; owner.ApplySettings(); };
-            Controls.Add(tb);
-            y += 46;
+            scroll.Controls.Add(tb);
+            y += 38;
 
             Lbl("显示项目", 18, y);
-            y += 26;
+            y += 22;
             Chk("CPU使用率", 18, y, st.ShowCpu, delegate(bool v) { st.ShowCpu = v; owner.ApplySettings(); });
             Chk("内存使用率", 210, y, st.ShowMem, delegate(bool v) { st.ShowMem = v; owner.ApplySettings(); });
-            Chk("流量监控", 18, y + 26, st.ShowNet, delegate(bool v) { st.ShowNet = v; owner.ApplySettings(); });
-            Chk("硬盘读写", 210, y + 26, st.ShowDisk, delegate(bool v) { st.ShowDisk = v; owner.ApplySettings(); });
-            Chk("CPU温度", 18, y + 52, st.ShowCpuTemp, delegate(bool v) { st.ShowCpuTemp = v; owner.ApplySettings(); });
-            Chk("显卡温度", 210, y + 52, st.ShowGpuTemp, delegate(bool v) { st.ShowGpuTemp = v; owner.ApplySettings(); });
-            Chk("显卡热点", 18, y + 78, st.ShowGpuHot, delegate(bool v) { st.ShowGpuHot = v; owner.ApplySettings(); });
-            Chk("主板温度", 210, y + 78, st.ShowBoardTemp, delegate(bool v) { st.ShowBoardTemp = v; owner.ApplySettings(); });
-            Chk("硬盘温度", 18, y + 104, st.ShowDiskTemp, delegate(bool v) { st.ShowDiskTemp = v; owner.ApplySettings(); });
-            Chk("内存温度", 210, y + 104, st.ShowDimmtemp, delegate(bool v) { st.ShowDimmtemp = v; owner.ApplySettings(); });
-            y += 134;
+            Chk("流量监控", 18, y + 24, st.ShowNet, delegate(bool v) { st.ShowNet = v; owner.ApplySettings(); });
+            Chk("硬盘读写", 210, y + 24, st.ShowDisk, delegate(bool v) { st.ShowDisk = v; owner.ApplySettings(); });
+            Chk("CPU温度", 18, y + 48, st.ShowCpuTemp, delegate(bool v) { st.ShowCpuTemp = v; owner.ApplySettings(); });
+            Chk("显卡温度", 210, y + 48, st.ShowGpuTemp, delegate(bool v) { st.ShowGpuTemp = v; owner.ApplySettings(); });
+            Chk("显卡热点", 18, y + 72, st.ShowGpuHot, delegate(bool v) { st.ShowGpuHot = v; owner.ApplySettings(); });
+            Chk("主板温度", 210, y + 72, st.ShowBoardTemp, delegate(bool v) { st.ShowBoardTemp = v; owner.ApplySettings(); });
+            Chk("硬盘温度", 18, y + 96, st.ShowDiskTemp, delegate(bool v) { st.ShowDiskTemp = v; owner.ApplySettings(); });
+            Chk("内存温度", 210, y + 96, st.ShowDimmtemp, delegate(bool v) { st.ShowDimmtemp = v; owner.ApplySettings(); });
+            y += 122;
 
             Label lbAl = new Label(); lbAl.Text = "温度报警"; lbAl.ForeColor = Color.FromArgb(200, 30, 30); lbAl.Location = new Point(18, y); lbAl.AutoSize = true;
-            Controls.Add(lbAl);
-            y += 26;
+            scroll.Controls.Add(lbAl);
+            y += 22;
             y = Toggle("启用温度报警（弹窗提醒）", y, st.Alarm, delegate(bool v) { st.Alarm = v; });
             y = Toggle("报警时播放提示音", y, st.AlarmSound, delegate(bool v) { st.AlarmSound = v; });
             y = Toggle("液冷异常检测（CPU 温升过快）", y, st.AlarmRise, delegate(bool v) { st.AlarmRise = v; });
 
-            Lbl("报警阈值（°C）", 18, y + 4);
-            y += 28;
+            Lbl("报警阈值（°C）", 18, y + 2);
+            y += 26;
             Num("CPU", 18, y, st.LimCpu, delegate(int v) { st.LimCpu = v; });
-            Num("显卡", 220, y, st.LimGpu, delegate(int v) { st.LimGpu = v; });
-            Num("热点", 18, y + 30, st.LimHot, delegate(int v) { st.LimHot = v; });
-            Num("主板", 220, y + 30, st.LimBoard, delegate(int v) { st.LimBoard = v; });
-            Num("硬盘", 18, y + 60, st.LimDisk, delegate(int v) { st.LimDisk = v; });
-            Num("内存", 220, y + 60, st.LimDimm, delegate(int v) { st.LimDimm = v; });
-            NumR("温升(20秒)", 18, y + 90, st.RiseLimit, 5, 60, delegate(int v) { st.RiseLimit = v; });
-            y += 124;
+            Num("显卡", 210, y, st.LimGpu, delegate(int v) { st.LimGpu = v; });
+            Num("热点", 18, y + 28, st.LimHot, delegate(int v) { st.LimHot = v; });
+            Num("主板", 210, y + 28, st.LimBoard, delegate(int v) { st.LimBoard = v; });
+            Num("硬盘", 18, y + 56, st.LimDisk, delegate(int v) { st.LimDisk = v; });
+            Num("内存", 210, y + 56, st.LimDimm, delegate(int v) { st.LimDimm = v; });
+            NumR("温升(20秒)", 18, y + 84, st.RiseLimit, 5, 60, delegate(int v) { st.RiseLimit = v; });
+            y += 116;
 
             y = Toggle("开机自启", y, st.AutoStart, delegate(bool v) { st.AutoStart = v; Settings.ApplyAutoStart(v); });
 
             Label tip = new Label();
-            tip.AutoSize = false; tip.Size = new Size(250, 84);
+            tip.AutoSize = false; tip.Size = new Size(240, 54);
             tip.Text = "温度来源：LibreHardwareMonitor + PawnIO（已签名）。\r\n驱动状态：" + (Driver.Installed() ? "已安装" : "未安装") + "。\r\n本程序固定以管理员权限运行。";
-            tip.ForeColor = Color.Gray; tip.Location = new Point(18, 704);
-            Controls.Add(tip);
+            tip.ForeColor = Color.Gray; tip.Location = new Point(18, y + 2);
+            scroll.Controls.Add(tip);
 
             Button btnDrv = new Button();
             btnDrv.Text = Driver.Installed() ? "重装温度驱动" : "安装温度驱动";
             btnDrv.Font = new Font("Microsoft YaHei UI", 8f);
-            btnDrv.Size = new Size(126, 26); btnDrv.Location = new Point(280, 706);
+            btnDrv.Size = new Size(130, 26); btnDrv.Location = new Point(266, y + 4);
             btnDrv.Click += delegate
             {
                 if (Driver.Installed() && MessageBox.Show("温度驱动已安装，要重新安装一遍吗？", "Ray雷达", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
@@ -972,52 +983,98 @@ namespace RayRadar
                 MessageBox.Show(ok ? "温度驱动已就绪。若温度仍显示 —，请关闭并重新打开 Ray雷达。" : "安装未完成（可能被取消）。可稍后再试。",
                     "Ray雷达", MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
             };
-            Controls.Add(btnDrv);
+            scroll.Controls.Add(btnDrv);
 
             CheckBox chkDrv = new CheckBox();
             chkDrv.Text = "缺驱动时启动提醒"; chkDrv.Font = new Font("Microsoft YaHei UI", 8f);
-            chkDrv.Location = new Point(280, 738); chkDrv.AutoSize = true; chkDrv.Checked = st.DriverAsk;
+            chkDrv.Location = new Point(266, y + 34); chkDrv.AutoSize = true; chkDrv.Checked = st.DriverAsk;
             chkDrv.CheckedChanged += delegate { st.DriverAsk = chkDrv.Checked; };
-            Controls.Add(chkDrv);
+            scroll.Controls.Add(chkDrv);
+            y += 64;
+
             FormClosing += delegate { st.Save(); };
+            scroll.AutoScrollMinSize = new Size(0, y + 8);
+
+            // 底部按钮固定不滚动
+            Button btn = new Button(); btn.Text = "关闭";
+            btn.Size = new Size(100, 30); btn.Location = new Point(18, ClientSize.Height - 42);
+            btn.Click += delegate { Close(); };
+            Controls.Add(btn);
 
             Button btnExit = new Button(); btnExit.Text = "退出 Ray雷达";
-            btnExit.Size = new Size(120, 30); btnExit.Location = new Point(ClientSize.Width - 140, ClientSize.Height - 46);
+            btnExit.Size = new Size(120, 30); btnExit.Location = new Point(ClientSize.Width - 138, ClientSize.Height - 42);
             btnExit.Click += delegate { Close(); owner.Close(); };
             Controls.Add(btnExit);
 
-            Button btn = new Button(); btn.Text = "关闭";
-            btn.Size = new Size(100, 30); btn.Location = new Point(18, ClientSize.Height - 46);
-            btn.Click += delegate { Close(); };
-            Controls.Add(btn);
+            HookWheel(this);   // 鼠标滚轮：指针在任何控件上都能滚动内容
         }
 
-        void Lbl(string t, int x, int y) { Label l = new Label(); l.Text = t; l.Location = new Point(x, y); l.AutoSize = true; Controls.Add(l); }
+        // 滚轮滚动内容区（数字框上滚动不会改数值，见 NoWheelNum）
+        public void ScrollBy(int delta)
+        {
+            try
+            {
+                int lines = SystemInformation.MouseWheelScrollLines;
+                if (lines <= 0) lines = 3;
+                int step = (delta / 120) * lines * 20;
+                int cur = -scroll.AutoScrollPosition.Y;
+                int max = Math.Max(0, scroll.AutoScrollMinSize.Height - scroll.ClientSize.Height);
+                int next = cur - step;
+                if (next < 0) next = 0;
+                if (next > max) next = max;
+                scroll.AutoScrollPosition = new Point(0, next);
+            }
+            catch { }
+        }
+
+        void HookWheel(Control c)
+        {
+            c.MouseWheel += delegate(object s, MouseEventArgs e) { ScrollBy(e.Delta); };
+            foreach (Control ch in c.Controls) HookWheel(ch);
+        }
+
+        // 数字框默认滚轮会改数值，这里屏蔽掉、改为滚动设置内容
+        class NoWheelNum : NumericUpDown
+        {
+            public SettingsForm F;
+            protected override void OnMouseWheel(MouseEventArgs e) { if (F != null) F.ScrollBy(e.Delta); }
+        }
+
+        void Lbl(string t, int x, int y) { Label l = new Label(); l.Text = t; l.Location = new Point(x, y); l.AutoSize = true; scroll.Controls.Add(l); }
         int Toggle(string text, int y, bool val, Changer onChange)
         {
             Lbl(text, 18, y + 6);
             ToggleSwitch t = new ToggleSwitch();
-            t.Location = new Point(ClientSize.Width - 70, y + 2); t.Checked = val;
+            t.Location = new Point(ClientSize.Width - 74, y + 2); t.Checked = val;
             t.CheckedChanged += delegate { onChange(t.Checked); };
-            Controls.Add(t);
-            return y + 34;
+            scroll.Controls.Add(t);
+            return y + 30;
+        }
+        void Toggle2(string text, int x, int y, bool val, Changer onChange)
+        {
+            Lbl(text, x, y + 6);
+            ToggleSwitch t = new ToggleSwitch();
+            t.Location = new Point(x + 140, y + 2); t.Checked = val;
+            t.CheckedChanged += delegate { onChange(t.Checked); };
+            scroll.Controls.Add(t);
         }
         void Chk(string text, int x, int y, bool val, Changer onChange)
         {
             CheckBox c = new CheckBox();
             c.Text = text; c.Location = new Point(x, y); c.AutoSize = true; c.Checked = val;
             if (onChange != null) c.CheckedChanged += delegate { onChange(c.Checked); };
-            Controls.Add(c);
+            scroll.Controls.Add(c);
         }
         void Num(string label, int x, int y, int val, ChangerInt onChange) { NumR(label, x, y, val, 20, 120, onChange); }
         void NumR(string label, int x, int y, int val, int min, int max, ChangerInt onChange)
         {
             Lbl(label, x, y + 3);
-            NumericUpDown n = new NumericUpDown();
+            NoWheelNum n = new NoWheelNum();
+            n.F = this;
             n.Minimum = min; n.Maximum = max; n.Value = Math.Max(min, Math.Min(max, val));
             n.Location = new Point(x + 82, y); n.Width = 60;
             n.ValueChanged += delegate { onChange((int)n.Value); };
-            Controls.Add(n);
+            scroll.Controls.Add(n);
         }
     }
     public delegate void ChangerInt(int v);
