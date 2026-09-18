@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -550,6 +550,8 @@ namespace RayRadar
         readonly DateTime startedAt = DateTime.Now;   // 程序启动时刻（温升报警预热用）
         const double RiseWarmupSeconds = 180;         // 启动后 3 分钟内不判温升（开机温度本身在爬升）
         const float RiseFloorC = 45f;                 // 温升报警还要求当前温度 ≥ 45°C，避免低温区的无意义波动
+        const double RiseConfirmSeconds = 20;         // 陡升后复测延时：仍持续升温才报警（区分负载尖峰与液冷故障）
+        DateTime risePending = DateTime.MinValue;     // 已测到陡升、等待复测的时刻
         int flushTick = 0;
 
         public RadarForm(Settings s)
@@ -654,14 +656,27 @@ namespace RayRadar
                 if (warm && cpuHist.Count > 2)
                 {
                     float rise = temp.Cpu - cpuHist[0].Value;
-                    if (rise >= st.RiseLimit && temp.Cpu >= RiseFloorC)
+                    bool over = (rise >= st.RiseLimit && temp.Cpu >= RiseFloorC);
+                    if (risePending == DateTime.MinValue)
                     {
-                        DateTime last;
-                        if (!(lastAlarm.TryGetValue("rise", out last) && (DateTime.Now - last).TotalMinutes < 5))
+                        // 第一次测到陡升：先只记下，不报警。
+                        // 游戏/编译等负载刚起来时会出现「升一下就不升了」的尖峰，
+                        // 而液冷故障是持续爬升——用第二次复测区分两者（2026-09-18 用户反馈每次启动游戏都误报）。
+                        if (over) risePending = now;
+                    }
+                    else if ((now - risePending).TotalSeconds >= RiseConfirmSeconds)
+                    {
+                        risePending = DateTime.MinValue;
+                        if (over)
                         {
-                            lastAlarm["rise"] = now;
-                            msgs.Add("CPU 温度 20 秒内上升 " + ((int)Math.Round(rise)) + "°C（当前 " + ((int)Math.Round(temp.Cpu)) + "°C，阈值 " + st.RiseLimit + "°C）");
-                            cpuHist.Clear();
+                            DateTime last;
+                            if (!(lastAlarm.TryGetValue("rise", out last) && (DateTime.Now - last).TotalMinutes < 5))
+                            {
+                                lastAlarm["rise"] = now;
+                                msgs.Add("CPU 温度持续上升，" + ((int)Math.Round(RiseConfirmSeconds + 20)) + " 秒内累计上升 "
+                                    + ((int)Math.Round(rise)) + "°C（当前 " + ((int)Math.Round(temp.Cpu)) + "°C）");
+                                cpuHist.Clear();
+                            }
                         }
                     }
                 }
@@ -1162,6 +1177,8 @@ namespace RayRadar
             y = Toggle("启用温度报警（弹窗提醒）", y, st.Alarm, delegate(bool v) { st.Alarm = v; });
             y = Toggle("报警时播放提示音", y, st.AlarmSound, delegate(bool v) { st.AlarmSound = v; });
             y = Toggle("液冷异常检测（CPU 温升过快）", y, st.AlarmRise, delegate(bool v) { st.AlarmRise = v; });
+            Hint2("需连续升温约 40 秒才报警，避免游戏启动等瞬时峰值误报", 18, y + 2);
+            y += 24;
 
             Lbl("报警阈值（°C）", 18, y + 2);
             y += 26;
@@ -1254,6 +1271,7 @@ namespace RayRadar
         }
 
         void Lbl(string t, int x, int y) { Label l = new Label(); l.Text = t; l.Location = new Point(x, y); l.AutoSize = true; scroll.Controls.Add(l); }
+        void Hint2(string t, int x, int y) { Label l = new Label(); l.Text = t; l.Location = new Point(x, y); l.AutoSize = true; l.ForeColor = Color.Gray; l.Font = new Font("Microsoft YaHei UI", 8f); scroll.Controls.Add(l); }
         int Toggle(string text, int y, bool val, Changer onChange)
         {
             Lbl(text, 18, y + 6);
