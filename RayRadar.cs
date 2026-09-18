@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -1245,7 +1245,20 @@ namespace RayRadar
     // ===== 流量统计：按天累计（只统计 Ray雷达 运行期间；Windows 本身不提供按天历史）=====
     public static class Traffic
     {
-        public static string FilePath { get { return Path.Combine(Settings.DirPath, "traffic.dat"); } }
+        // 数据文件路径；可用环境变量 RAYRADAR_TRAFFIC_DATA 覆盖（自测/演示用，不影响正式数据）
+        public static string FilePath
+        {
+            get
+            {
+                try
+                {
+                    string custom = Environment.GetEnvironmentVariable("RAYRADAR_TRAFFIC_DATA");
+                    if (!string.IsNullOrEmpty(custom)) return custom;
+                }
+                catch { }
+                return Path.Combine(Settings.DirPath, "traffic.dat");
+            }
+        }
         static Dictionary<string, long[]> days = new Dictionary<string, long[]>();
         static bool loaded = false;
 
@@ -1281,13 +1294,51 @@ namespace RayRadar
         {
             try
             {
-                Directory.CreateDirectory(Settings.DirPath);
+                string path = FilePath;
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                 List<string> keys = new List<string>(days.Keys); keys.Sort();
                 List<string> lines = new List<string>();
                 foreach (string k in keys) lines.Add(k + "\t" + days[k][0] + "\t" + days[k][1]);
-                File.WriteAllLines(FilePath, lines.ToArray());
+                // 先写临时文件再替换，避免写一半断电把历史数据写坏
+                string tmp = path + ".tmp";
+                File.WriteAllLines(tmp, lines.ToArray());
+                if (File.Exists(path)) File.Delete(path);
+                File.Move(tmp, path);
             }
             catch { }
+        }
+
+        // 升序返回最近 days 天（没有记录的日子补 0）——画柱状图用
+        public static List<KeyValuePair<string, long[]>> RecentAsc(int count)
+        {
+            if (!loaded) Load();
+            List<KeyValuePair<string, long[]>> list = new List<KeyValuePair<string, long[]>>();
+            DateTime today = DateTime.Today;
+            for (int i = count - 1; i >= 0; i--)
+            {
+                string k = today.AddDays(-i).ToString("yyyy-MM-dd");
+                long[] v;
+                if (days.ContainsKey(k)) v = days[k]; else v = new long[2];
+                list.Add(new KeyValuePair<string, long[]>(k, v));
+            }
+            return list;
+        }
+
+        // 全部有记录的日子，按日期倒序（表格用；最多 max 条，默认保留一整年）
+        public static List<KeyValuePair<string, long[]>> AllDays(int max)
+        {
+            if (!loaded) Load();
+            List<string> keys = new List<string>(days.Keys);
+            keys.Sort();
+            keys.Reverse();
+            List<KeyValuePair<string, long[]>> list = new List<KeyValuePair<string, long[]>>();
+            foreach (string k in keys)
+            {
+                if (list.Count >= max) break;
+                list.Add(new KeyValuePair<string, long[]>(k, days[k]));
+            }
+            return list;
         }
         public static DateTime FirstDay()
         {
@@ -1336,81 +1387,343 @@ namespace RayRadar
         }
     }
 
-    // 流量统计窗口（点浮窗上的「网速块」打开）
+    // ===== 流量趋势图：手绘堆叠柱状图（下行=蓝，上行=橙），带坐标轴、图例与悬停提示 =====
+    public class TrafficChart : Control
+    {
+        public static readonly Color ColDown = Color.FromArgb(45, 120, 240);
+        public static readonly Color ColUp = Color.FromArgb(245, 158, 11);
+        static readonly Color ColGrid = Color.FromArgb(237, 239, 242);
+        static readonly Color ColAxis = Color.FromArgb(155, 158, 165);
+        static readonly Color ColText = Color.FromArgb(80, 84, 92);
+
+        int days = 14;
+        List<KeyValuePair<string, long[]>> data = new List<KeyValuePair<string, long[]>>();
+        int hover = -1;
+        Point mouse = new Point(-1, -1);
+
+        public TrafficChart()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Color.White;
+        }
+        public int Days { get { return days; } }
+        public void SetDays(int d) { days = d; Reload(); }
+        public void Reload() { data = Traffic.RecentAsc(days); hover = -1; Invalidate(); }
+
+        Rectangle Plot { get { return new Rectangle(68, 30, Math.Max(20, Width - 68 - 16), Math.Max(20, Height - 30 - 30)); } }
+
+        public static GraphicsPath RRect(Rectangle r, int rad)
+        {
+            GraphicsPath p = new GraphicsPath();
+            p.AddArc(r.X, r.Y, rad * 2, rad * 2, 180, 90);
+            p.AddArc(r.Right - rad * 2, r.Y, rad * 2, rad * 2, 270, 90);
+            p.AddArc(r.Right - rad * 2, r.Bottom - rad * 2, rad * 2, rad * 2, 0, 90);
+            p.AddArc(r.X, r.Bottom - rad * 2, rad * 2, rad * 2, 90, 90);
+            p.CloseFigure(); return p;
+        }
+        // 把上限凑成 1/2/5×10^n，坐标轴刻度才好看
+        static long NiceCeil(long v)
+        {
+            if (v <= 4096) return 4096;
+            double p = Math.Pow(10, Math.Floor(Math.Log10(v)));
+            double n = v / p;
+            double nice = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+            return (long)(nice * p);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            mouse = e.Location;
+            int idx = -1;
+            Rectangle p = Plot;
+            if (data.Count > 0 && e.X >= p.Left && e.X <= p.Right && e.Y >= p.Top - 6 && e.Y <= p.Bottom + 6)
+            {
+                int slot = Math.Max(1, p.Width / data.Count);
+                idx = (e.X - p.Left) / slot;
+                if (idx < 0 || idx >= data.Count) idx = -1;
+            }
+            if (idx != hover) { hover = idx; Invalidate(); }
+            else if (idx >= 0) Invalidate();   // 提示框跟随鼠标
+        }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = -1; Invalidate(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            g.Clear(BackColor);
+            Rectangle p = Plot;
+
+            // 图例
+            using (Font f = new Font("Microsoft YaHei UI", 8.5f))
+            using (SolidBrush bTxt = new SolidBrush(ColText))
+            {
+                int lx = p.Right - 132;
+                using (SolidBrush b = new SolidBrush(ColDown)) g.FillRectangle(b, lx, 11, 12, 12);
+                g.DrawString("下行", f, bTxt, lx + 17, 10);
+                using (SolidBrush b = new SolidBrush(ColUp)) g.FillRectangle(b, lx + 62, 11, 12, 12);
+                g.DrawString("上行", f, bTxt, lx + 79, 10);
+            }
+
+            long max = 1;
+            foreach (KeyValuePair<string, long[]> kv in data)
+            {
+                long t = kv.Value[0] + kv.Value[1];
+                if (t > max) max = t;
+            }
+            long top = NiceCeil(max);
+
+            // Y 轴网格与刻度（自动 KB / MB / GB）
+            using (Font f = new Font("Microsoft YaHei UI", 8f))
+            using (Pen grid = new Pen(ColGrid))
+            using (SolidBrush ax = new SolidBrush(ColAxis))
+            {
+                for (int i = 0; i <= 4; i++)
+                {
+                    int y = p.Bottom - (int)((long)p.Height * i / 4);
+                    g.DrawLine(grid, p.Left, y, p.Right, y);
+                    string lab = (i == 0) ? "0" : Traffic.Size(top * i / 4);
+                    SizeF sz = g.MeasureString(lab, f);
+                    g.DrawString(lab, f, ax, p.Left - 8 - sz.Width, y - sz.Height / 2);
+                }
+            }
+
+            if (data.Count == 0)
+            {
+                using (Font f = new Font("Microsoft YaHei UI", 9f))
+                using (SolidBrush b = new SolidBrush(ColAxis))
+                {
+                    string s = "暂无数据";
+                    SizeF sz = g.MeasureString(s, f);
+                    g.DrawString(s, f, b, p.Left + (p.Width - sz.Width) / 2, p.Top + (p.Height - sz.Height) / 2);
+                }
+                return;
+            }
+
+            int slot = Math.Max(1, p.Width / data.Count);
+            int bw = Math.Max(5, (int)(slot * 0.6));
+            for (int i = 0; i < data.Count; i++)
+            {
+                long rx = data[i].Value[0], tx = data[i].Value[1];
+                int x = p.Left + slot * i + (slot - bw) / 2;
+                int hDown = (int)((double)rx / top * p.Height);
+                int hUp = (int)((double)tx / top * p.Height);
+                if (hDown < 1 && rx > 0) hDown = 1;
+                if (hUp < 1 && tx > 0) hUp = 1;
+                if (hDown > 0) using (SolidBrush b = new SolidBrush(i == hover ? ControlPaint.Dark(ColDown, 0.06f) : ColDown)) g.FillRectangle(b, new Rectangle(x, p.Bottom - hDown, bw, hDown));
+                if (hUp > 0) using (SolidBrush b = new SolidBrush(i == hover ? ControlPaint.Dark(ColUp, 0.06f) : ColUp)) g.FillRectangle(b, new Rectangle(x, p.Bottom - hDown - hUp, bw, hUp));
+                if (hDown + hUp == 0)
+                {
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(226, 229, 233))) g.FillRectangle(b, new Rectangle(x, p.Bottom - 2, bw, 2));
+                }
+                bool showLab = data.Count <= 16 || i % 2 == 0;
+                if (showLab)
+                {
+                    string dl = data[i].Key.Length >= 10 ? data[i].Key.Substring(5) : data[i].Key;
+                    using (Font f = new Font("Microsoft YaHei UI", 7.5f))
+                    using (SolidBrush b = new SolidBrush(ColAxis))
+                    {
+                        SizeF sz = g.MeasureString(dl, f);
+                        g.DrawString(dl, f, b, x + bw / 2f - sz.Width / 2, p.Bottom + 5);
+                    }
+                }
+            }
+
+            // 悬停提示框
+            if (hover >= 0 && hover < data.Count)
+            {
+                KeyValuePair<string, long[]> kv = data[hover];
+                string l1 = kv.Key;
+                string l2 = "↓ 下行　" + Traffic.Size(kv.Value[0]);
+                string l3 = "↑ 上行　" + Traffic.Size(kv.Value[1]);
+                string l4 = "合计　　" + Traffic.Size(kv.Value[0] + kv.Value[1]);
+                using (Font f = new Font("Microsoft YaHei UI", 8.5f))
+                using (Font fb = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Bold))
+                {
+                    SizeF s1 = g.MeasureString(l1, fb), s2 = g.MeasureString(l2, f), s3 = g.MeasureString(l3, f), s4 = g.MeasureString(l4, fb);
+                    int w = (int)Math.Max(Math.Max(s1.Width, s2.Width), Math.Max(s3.Width, s4.Width)) + 22;
+                    int h = (int)(s1.Height + s2.Height + s3.Height + s4.Height) + 18;
+                    int bx = mouse.X + 16, by = mouse.Y - h - 8;
+                    if (bx + w > Width - 4) bx = mouse.X - w - 16;
+                    if (bx < 4) bx = 4;
+                    if (by < 4) by = mouse.Y + 18;
+                    if (by + h > Height - 4) by = Height - h - 4;
+                    Rectangle box = new Rectangle(bx, by, w, h);
+                    using (SolidBrush bg = new SolidBrush(Color.FromArgb(252, 252, 253))) g.FillPath(bg, RRect(box, 6));
+                    using (Pen pen = new Pen(Color.FromArgb(205, 209, 216))) g.DrawPath(pen, RRect(box, 6));
+                    float ty = by + 8;
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(60, 64, 72))) g.DrawString(l1, fb, b, bx + 11, ty);
+                    ty += s1.Height;
+                    using (SolidBrush b = new SolidBrush(ColDown)) g.DrawString(l2, f, b, bx + 11, ty);
+                    ty += s2.Height;
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(200, 120, 10))) g.DrawString(l3, f, b, bx + 11, ty);
+                    ty += s3.Height;
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(60, 64, 72))) g.DrawString(l4, fb, b, bx + 11, ty);
+                }
+            }
+        }
+    }
+
+    // 流量统计窗口（点浮窗上的「网速块」打开）：上=总览卡片，中=柱状图，下=历史明细
     public class TrafficForm : Form
     {
+        TrafficChart chart;
+        DataGridView grid;
+        Button b14, b30;
+
         public TrafficForm()
         {
             Text = "Ray雷达 - 流量统计";
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(430, 392);
+            ClientSize = new Size(780, 672);
+            BackColor = Color.FromArgb(247, 248, 250);
             Font = new Font("Microsoft YaHei UI", 9f);
             TopMost = true;
 
-            Label head = new Label();
-            head.AutoSize = false; head.Size = new Size(400, 22);
-            head.Font = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold);
-            head.Text = "流量统计　↓ 下行　↑ 上行";
-            head.Location = new Point(14, 12);
-            Controls.Add(head);
+            Label title = new Label();
+            title.Text = "流量统计"; title.Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold);
+            title.ForeColor = Color.FromArgb(40, 44, 52); title.AutoSize = true; title.Location = new Point(20, 14);
+            Controls.Add(title);
 
             DateTime first = Traffic.FirstDay();
-            Label sub = new Label();
-            sub.AutoSize = false; sub.Size = new Size(400, 34);
-            sub.ForeColor = Color.Gray;
-            sub.Text = first == DateTime.MinValue
-                ? "暂无数据：Ray雷达 只在运行时统计流量，从今天开始累计。"
-                : "统计起始 " + first.ToString("yyyy-MM-dd") + "　（只统计 Ray雷达 运行期间，按天累计；Windows 不提供按天历史）";
-            sub.Location = new Point(14, 38);
-            Controls.Add(sub);
+            Label note = new Label();
+            note.AutoSize = false; note.Size = new Size(560, 20);
+            note.ForeColor = Color.FromArgb(140, 144, 152);
+            note.Font = new Font("Microsoft YaHei UI", 8.5f);
+            note.Text = first == DateTime.MinValue
+                ? "暂无数据：Ray雷达 只在运行时统计，从今天开始累计"
+                : "统计起始 " + first.ToString("yyyy-MM-dd") + "　·　只统计 Ray雷达 运行期间，按天累计（Windows 无按天历史接口）";
+            note.Location = new Point(22, 40);
+            Controls.Add(note);
 
-            int y = 78;
-            y = Row("今天（最近 1 天）", 1, y);
-            y = Row("最近 30 天", 30, y);
-            y = Row("最近 1 年", 365, y);
+            // ── 总览卡片 ──
+            long rx, tx;
+            int cx = 20;
+            Traffic.Sum(1, out rx, out tx); Card("今天", "最近 1 天", rx, tx, cx); cx += 250;
+            Traffic.Sum(30, out rx, out tx); Card("最近 30 天", null, rx, tx, cx); cx += 250;
+            Traffic.Sum(365, out rx, out tx); Card("最近 1 年", null, rx, tx, cx);
 
-            Label lb = new Label();
-            lb.Text = "最近 14 天明细"; lb.Location = new Point(14, y + 6); lb.AutoSize = true; lb.ForeColor = Color.Gray;
-            Controls.Add(lb);
-            y += 26;
+            // ── 图表区 ──
+            Label lbChart = new Label();
+            lbChart.Text = "流量趋势"; lbChart.Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
+            lbChart.ForeColor = Color.FromArgb(40, 44, 52); lbChart.AutoSize = true; lbChart.Location = new Point(20, 184);
+            Controls.Add(lbChart);
 
-            ListView lv = new ListView();
-            lv.View = View.Details; lv.FullRowSelect = true; lv.HeaderStyle = ColumnHeaderStyle.Nonclickable;
-            lv.Location = new Point(14, y); lv.Size = new Size(402, 146);
-            lv.Columns.Add("日期", 112); lv.Columns.Add("下行", 95); lv.Columns.Add("上行", 95); lv.Columns.Add("合计", 95);
-            Controls.Add(lv);
-            foreach (KeyValuePair<string, long[]> kv in Traffic.Recent(14))
-            {
-                ListViewItem it = new ListViewItem(kv.Key);
-                it.SubItems.Add(Traffic.Size(kv.Value[0]));
-                it.SubItems.Add(Traffic.Size(kv.Value[1]));
-                it.SubItems.Add(Traffic.Size(kv.Value[0] + kv.Value[1]));
-                lv.Items.Add(it);
-            }
+            b14 = MkTab("最近 14 天", 552, true);
+            b30 = MkTab("最近 30 天", 646, false);
+            b14.Click += delegate { SetChart(14); };
+            b30.Click += delegate { SetChart(30); };
+
+            chart = new TrafficChart();
+            chart.Location = new Point(20, 210);
+            chart.Size = new Size(740, 232);
+            chart.SetDays(14);
+            Controls.Add(chart);
+
+            // ── 历史明细 ──
+            Label lbHist = new Label();
+            lbHist.Text = "历史明细（可滚动）"; lbHist.Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
+            lbHist.ForeColor = Color.FromArgb(40, 44, 52); lbHist.AutoSize = true; lbHist.Location = new Point(20, 450);
+            Controls.Add(lbHist);
+
+            grid = new DataGridView();
+            grid.Location = new Point(20, 476); grid.Size = new Size(740, 148);
+            grid.ReadOnly = true; grid.AllowUserToAddRows = false; grid.AllowUserToDeleteRows = false;
+            grid.AllowUserToResizeRows = false; grid.RowHeadersVisible = false;
+            grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect; grid.MultiSelect = false;
+            grid.BackgroundColor = Color.White; grid.BorderStyle = BorderStyle.FixedSingle;
+            grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+            grid.GridColor = Color.FromArgb(238, 240, 243);
+            grid.EnableHeadersVisualStyles = false;
+            grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
+            grid.ColumnHeadersHeight = 30;
+            grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(244, 246, 249);
+            grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(90, 94, 102);
+            grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Bold);
+            grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = Color.FromArgb(244, 246, 249);
+            grid.RowTemplate.Height = 26;
+            grid.DefaultCellStyle.BackColor = Color.White;
+            grid.DefaultCellStyle.ForeColor = Color.FromArgb(60, 64, 72);
+            grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(222, 235, 254);
+            grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(30, 34, 40);
+            grid.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(250, 251, 252);   // 斑马纹
+            grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            Controls.Add(grid);
+            grid.Columns.Add("d", "日期");
+            grid.Columns.Add("rx", "下行");
+            grid.Columns.Add("tx", "上行");
+            grid.Columns.Add("all", "合计");
+            grid.Columns[1].DefaultCellStyle.ForeColor = TrafficChart.ColDown;
+            grid.Columns[2].DefaultCellStyle.ForeColor = Color.FromArgb(200, 120, 10);
+            grid.Columns[3].DefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold);
+            foreach (KeyValuePair<string, long[]> kv in Traffic.AllDays(366))
+                grid.Rows.Add(kv.Key, Traffic.Size(kv.Value[0]), Traffic.Size(kv.Value[1]), Traffic.Size(kv.Value[0] + kv.Value[1]));
+            grid.ClearSelection();          // 别默认选中第一行
+            grid.CurrentCell = null;
 
             Button ok = new Button();
-            ok.Text = "知道了"; ok.Size = new Size(100, 28);
-            ok.Location = new Point((ClientSize.Width - 100) / 2, ClientSize.Height - 38);
+            ok.Text = "关闭"; ok.Size = new Size(100, 30);
+            ok.FlatStyle = FlatStyle.System;
+            ok.Location = new Point(ClientSize.Width - 120, ClientSize.Height - 38);
             ok.Click += delegate { Close(); };
             Controls.Add(ok);
             AcceptButton = ok;
         }
 
-        int Row(string label, int backDays, int y)
+        void SetChart(int d)
         {
-            long rx, tx;
-            Traffic.Sum(backDays, out rx, out tx);
-            Label l = new Label();
-            l.Text = label; l.Location = new Point(14, y); l.AutoSize = true;
-            Controls.Add(l);
-            Label v = new Label();
-            v.Text = "↓ " + Traffic.Size(rx) + "　↑ " + Traffic.Size(tx) + "　合计 " + Traffic.Size(rx + tx);
-            v.Location = new Point(150, y); v.AutoSize = true;
-            v.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold);
-            Controls.Add(v);
-            return y + 26;
+            chart.SetDays(d);
+            Style(b14, d == 14); Style(b30, d == 30);
+        }
+
+        Button MkTab(string text, int x, bool active)
+        {
+            Button b = new Button();
+            b.Text = text; b.Size = new Size(88, 26); b.Location = new Point(x, 181);
+            b.FlatStyle = FlatStyle.Flat; b.FlatAppearance.BorderSize = 0;
+            b.Font = new Font("Microsoft YaHei UI", 8.5f);
+            Controls.Add(b);
+            Style(b, active);
+            return b;
+        }
+        static void Style(Button b, bool active)
+        {
+            b.BackColor = active ? Color.FromArgb(45, 120, 240) : Color.FromArgb(232, 235, 240);
+            b.ForeColor = active ? Color.White : Color.FromArgb(90, 94, 102);
+        }
+
+        // 总览卡片：圆角白底 + 下行(蓝)/上行(橙)/合计
+        void Card(string head, string sub, long rx, long tx, int x)
+        {
+            Panel p = new Panel();
+            p.Location = new Point(x, 62); p.Size = new Size(240, 106);
+            p.BackColor = Color.White;
+            p.Paint += delegate(object s, PaintEventArgs e)
+            {
+                Graphics g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                Rectangle box = new Rectangle(0, 0, p.Width - 1, p.Height - 1);
+                using (Pen pen = new Pen(Color.FromArgb(230, 233, 238))) g.DrawPath(pen, TrafficChart.RRect(box, 8));
+                using (Font fh = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold))
+                using (Font fs = new Font("Microsoft YaHei UI", 7.5f))
+                using (Font fv = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold))
+                using (Font ft = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold))
+                {
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(60, 64, 72))) g.DrawString(head, fh, b, 14, 10);
+                    if (sub != null) using (SolidBrush b = new SolidBrush(Color.FromArgb(150, 154, 162))) g.DrawString(sub, fs, b, 14 + g.MeasureString(head, fh).Width + 6, 13);
+                    using (SolidBrush b = new SolidBrush(TrafficChart.ColDown))
+                    { g.DrawString("↓ 下行", fs, b, 14, 38); g.DrawString(Traffic.Size(rx), fv, b, 14, 52); }
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(200, 120, 10)))
+                    { g.DrawString("↑ 上行", fs, b, 128, 38); g.DrawString(Traffic.Size(tx), fv, b, 128, 52); }
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(70, 74, 82)))
+                        g.DrawString("合计 " + Traffic.Size(rx + tx), ft, b, 14, 80);
+                }
+            };
+            Controls.Add(p);
         }
     }
 
