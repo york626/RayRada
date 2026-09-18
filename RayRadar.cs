@@ -732,7 +732,8 @@ namespace RayRadar
             SnapToEdges(); st.X = Location.X; st.Y = Location.Y; st.Save(); ApplyDock();
             if (flyout != null && flyout.Visible) PositionFlyout();
         }
-        protected override void OnMouseDoubleClick(MouseEventArgs e) { base.OnMouseDoubleClick(e); HideFlyout(); OpenSettings(); }
+        // 双击不再打开设置窗口（用户 2026-09-18 要求：只有右键打开设置）；双击时顺手收起温度浮层
+        protected override void OnMouseDoubleClick(MouseEventArgs e) { base.OnMouseDoubleClick(e); HideFlyout(); }
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); if (collapsed) { Bounds = expandBounds; collapsed = false; } }
 
         void ClampToWorkArea()

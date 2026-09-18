@@ -14,7 +14,12 @@ if (-not (Test-Path "$dir\lib\LibreHardwareMonitorLib.dll")) { throw "lib\LibreH
 Get-Process RayRadar -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 if (Get-Process RayRadar -ErrorAction SilentlyContinue) {
-  # RayRada 以管理员权限运行，普通权限杀不掉：改用计划任务结束它
+  # 兜底 1：taskkill（对同用户的提权进程通常有效）
+  & taskkill.exe /F /IM RayRadar.exe 2>$null | Out-Null
+  Start-Sleep -Seconds 2
+}
+if (Get-Process RayRadar -ErrorAction SilentlyContinue) {
+  # 兜底 2：用计划任务结束它
   & schtasks.exe /End /TN RayRadar 2>$null | Out-Null
   Start-Sleep -Seconds 2
 }
