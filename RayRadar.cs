@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -208,6 +208,8 @@ namespace RayRadar
         public bool ShowCpu = true, ShowMem = true, ShowNet = true, ShowDisk = false;
         public bool ShowCpuTemp = true, ShowGpuTemp = true, ShowGpuHot = true, ShowBoardTemp = true, ShowDiskTemp = true, ShowDimmtemp = false;
         public bool DriverAsk = true;
+        public bool CollapseTemps = true;          // 温度折叠：浮窗上只显示「主温度」，点它在上方展开其它
+        public string MainTemp = "CPU";            // 主温度键：CPU/GPU/Hot/Board/Disk/Dimm
         public bool Alarm = true, AlarmSound = true, AlarmRise = true;
         public int LimCpu = 90, LimGpu = 85, LimHot = 95, LimBoard = 65, LimDisk = 75, LimDimm = 60, RiseLimit = 15;
 
@@ -259,6 +261,8 @@ namespace RayRadar
                         case "RiseLimit": s.RiseLimit = I(v, 15); break;
                         case "AutoStart": s.AutoStart = b; break;
                         case "DriverAsk": s.DriverAsk = b; break;
+                        case "CollapseTemps": s.CollapseTemps = b; break;
+                        case "MainTemp": s.MainTemp = v; break;
                     }
                 }
             }
@@ -281,6 +285,7 @@ namespace RayRadar
                 ab("Alarm", Alarm); ab("AlarmSound", AlarmSound); ab("AlarmRise", AlarmRise);
                 ai("LimCpu", LimCpu); ai("LimGpu", LimGpu); ai("LimHot", LimHot); ai("LimBoard", LimBoard); ai("LimDisk", LimDisk); ai("LimDimm", LimDimm); ai("RiseLimit", RiseLimit);
                 ab("AutoStart", AutoStart); ab("DriverAsk", DriverAsk);
+                ab("CollapseTemps", CollapseTemps); L.Add("MainTemp=" + MainTemp);
                 File.WriteAllLines(FilePath, L.ToArray());
             }
             catch { }
@@ -509,6 +514,9 @@ namespace RayRadar
         bool tempBlocked = false;
         bool driverChecked = false;
         int topTick = 0;
+        TempFlyout flyout;
+        Point downPt; bool downLeft = false;
+        int flushTick = 0;
 
         public RadarForm(Settings s)
         {
@@ -537,6 +545,8 @@ namespace RayRadar
             timer = new System.Windows.Forms.Timer(); timer.Interval = 1000; timer.Tick += new EventHandler(OnTick); timer.Start();
             tempTimer = new System.Windows.Forms.Timer(); tempTimer.Interval = 3000; tempTimer.Tick += new EventHandler(OnTempTick); tempTimer.Start();
             Shown += delegate { ApplyTopMost(); OnTempTick(null, null); };
+            try { Traffic.Load(); } catch { }
+            FormClosing += delegate { try { Traffic.Save(); } catch { } HideFlyout(); };
         }
 
         void OnTempTick(object sender, EventArgs e)
@@ -545,6 +555,7 @@ namespace RayRadar
             if (!driverChecked) { driverChecked = true; TryDriverPrompt(); }
             CheckAlarm();
             Invalidate();
+            if (flyout != null && flyout.Visible) flyout.Invalidate();
         }
 
         // 换到新电脑时：没有 PawnIO 驱动就读不到 CPU 温度，这里一次性提示并就地安装（安装包内置在 exe 里）
@@ -636,15 +647,11 @@ namespace RayRadar
             if (st.ShowMem) w += BW;
             if (st.ShowNet) w += BWNET;
             if (st.ShowDisk) w += BWNET;
-            if (st.ShowCpuTemp) w += BW;
-            if (st.ShowGpuTemp) w += BW;
-            if (st.ShowGpuHot) w += BW;
-            if (st.ShowBoardTemp) w += BW;
-            if (st.ShowDiskTemp) w += BW;
-            if (st.ShowDimmtemp) w += BW;
+            foreach (string k in TempKeys) if (ShowTemp(k)) w += BW;
             if (w == 0) w = BW;
             ClientSize = new Size(w, BH);
             ApplyTopMost();
+            if (flyout != null && flyout.Visible) { flyout.Rebuild(); PositionFlyout(); }
             Invalidate();
         }
 
@@ -695,7 +702,8 @@ namespace RayRadar
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (e.Button == MouseButtons.Right) { OpenSettings(); return; }
+            downPt = e.Location; downLeft = (e.Button == MouseButtons.Left);
+            if (e.Button == MouseButtons.Right) { HideFlyout(); OpenSettings(); return; }
             if (e.Button == MouseButtons.Left && !st.LockPos && !collapsed)
             { dragging = true; dragOff = new Point(Cursor.Position.X - Location.X, Cursor.Position.Y - Location.Y); }
         }
@@ -707,15 +715,24 @@ namespace RayRadar
             int nx = Cursor.Position.X - dragOff.X, ny = Cursor.Position.Y - dragOff.Y;
             if (nx < wa.Left) nx = wa.Left; if (ny < wa.Top) ny = wa.Top;
             if (nx + Width > wa.Right) nx = wa.Right - Width; if (ny + Height > wa.Bottom) ny = wa.Bottom - Height;
+            if (nx == Location.X && ny == Location.Y) return;
             Location = new Point(nx, ny);
+            // 拖动时让展开的温度浮层跟着走（不要在这里隐藏：鼠标 1px 抖动也会走这条分支，
+            // 会导致「点第二次收不起来」——2026-09-18 实测踩到过）
+            if (flyout != null && flyout.Visible) PositionFlyout();
         }
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
-            if (!dragging) return;
-            dragging = false; SnapToEdges(); st.X = Location.X; st.Y = Location.Y; st.Save(); ApplyDock();
+            bool wasDrag = dragging;
+            dragging = false;
+            bool isClick = downLeft && Math.Abs(e.X - downPt.X) <= 4 && Math.Abs(e.Y - downPt.Y) <= 4;
+            if (isClick) { HandleClick(e.X); return; }        // 纯点击：区分「点网速看流量」「点主温度展开」
+            if (!wasDrag) return;
+            SnapToEdges(); st.X = Location.X; st.Y = Location.Y; st.Save(); ApplyDock();
+            if (flyout != null && flyout.Visible) PositionFlyout();
         }
-        protected override void OnMouseDoubleClick(MouseEventArgs e) { base.OnMouseDoubleClick(e); OpenSettings(); }
+        protected override void OnMouseDoubleClick(MouseEventArgs e) { base.OnMouseDoubleClick(e); HideFlyout(); OpenSettings(); }
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); if (collapsed) { Bounds = expandBounds; collapsed = false; } }
 
         void ClampToWorkArea()
@@ -746,6 +763,7 @@ namespace RayRadar
             bool atEdge = (Location.X <= scr.Left + edge) || (Location.X + Width >= wa.Right - edge) || (Location.Y <= scr.Top + edge) || (Location.Y + Height >= wa.Bottom - edge);
             if (atEdge && !collapsed)
             {
+                HideFlyout();
                 expandBounds = Bounds;
                 if (Location.X <= scr.Left + edge) Bounds = new Rectangle(scr.Left, Location.Y, 6, Height);
                 else if (Location.X + Width >= wa.Right - edge) Bounds = new Rectangle(wa.Right - 6, Location.Y, 6, Height);
@@ -782,10 +800,137 @@ namespace RayRadar
             DateTime now = DateTime.Now;
             double sec = (now - pTime).TotalSeconds; if (sec <= 0) sec = 1;
             if (pRx > 0) { dnK = (rx - pRx) / 1024.0 / sec; upK = (tx - pTx) / 1024.0 / sec; }
+            if (pRx > 0)
+            {
+                // 按天累计流量（只统计本程序运行期间；换网卡/重启网卡导致的负增量忽略）
+                long dRx = rx - pRx, dTx = tx - pTx;
+                if (dRx < 0) dRx = 0;
+                if (dTx < 0) dTx = 0;
+                if (dRx > 0 || dTx > 0) Traffic.Add(dRx, dTx);
+                if (++flushTick >= 60) { flushTick = 0; try { Traffic.Save(); } catch { } }
+            }
             pRx = rx; pTx = tx; pTime = now;
             if (st.ShowDisk && diskOk)
             { try { rdK = diskR.NextValue() / 1024.0; wrK = diskW.NextValue() / 1024.0; } catch { diskOk = false; } }
             if (++topTick >= 5) { topTick = 0; EnsureTopMost(); }
+            Invalidate();
+            if (flyout != null && flyout.Visible) flyout.Invalidate();
+        }
+
+        // ===== 温度块：哪些显示在浮窗上 / 哪些放进展开浮层 =====
+        static readonly string[] TempKeys = new string[] { "CPU", "GPU", "Hot", "Board", "Disk", "Dimm" };
+
+        bool TempOn(string k)
+        {
+            switch (k)
+            {
+                case "CPU": return st.ShowCpuTemp;
+                case "GPU": return st.ShowGpuTemp;
+                case "Hot": return st.ShowGpuHot;
+                case "Board": return st.ShowBoardTemp;
+                case "Disk": return st.ShowDiskTemp;
+                case "Dimm": return st.ShowDimmtemp;
+            }
+            return false;
+        }
+        float TempVal(string k)
+        {
+            if (temp == null) return -1000;
+            switch (k)
+            {
+                case "CPU": return temp.Cpu;
+                case "GPU": return temp.Gpu;
+                case "Hot": return temp.Hot;
+                case "Board": return temp.Board;
+                case "Disk": return temp.Disk;
+                case "Dimm": return temp.Dimm;
+            }
+            return -1000;
+        }
+        string TempCap(string k)
+        {
+            switch (k)
+            {
+                case "CPU": return "CPU";
+                case "GPU": return "显卡";
+                case "Hot": return "热点";
+                case "Board": return "主板";
+                case "Disk": return "硬盘";
+                case "Dimm": return "内存";
+            }
+            return k;
+        }
+        // 该温度块是否画在浮窗本体上（折叠时只画主温度）
+        bool ShowTemp(string k) { return TempOn(k) && (!st.CollapseTemps || k == st.MainTemp); }
+
+        // 展开浮层要显示的内容（折叠时：勾选过、且不是主温度的那些）
+        public List<string[]> FlyoutItems()
+        {
+            List<string[]> list = new List<string[]>();
+            if (!st.CollapseTemps) return list;
+            foreach (string k in TempKeys)
+                if (TempOn(k) && k != st.MainTemp) list.Add(new string[] { TempCap(k), T(TempVal(k)) });
+            return list;
+        }
+        public Color[] SkinColors() { return Skins.Get(st.Skin); }
+        public Color FgColor() { return st.TextBlack ? Color.Black : Color.White; }
+        public Font CapFont { get { return fCap; } }
+        public Font ValFont { get { return fVal; } }
+
+        void ToggleFlyout()
+        {
+            try
+            {
+                if (FlyoutItems().Count == 0)
+                {
+                    MessageBox.Show("没有可展开的温度：请在「设置 → 显示项目」里勾选其它温度。", "Ray雷达", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                if (flyout == null) flyout = new TempFlyout(this);
+                if (flyout.Visible) { flyout.Hide(); return; }
+                flyout.Rebuild();
+                PositionFlyout();
+                flyout.Show();
+                flyout.ApplyTopMost();
+            }
+            catch { }
+        }
+        void PositionFlyout()
+        {
+            if (flyout == null) return;
+            Rectangle wa = Screen.FromControl(this).WorkingArea;
+            int w = flyout.Width, h = flyout.Height;
+            int x = Left;
+            if (x + w > wa.Right) x = wa.Right - w;
+            if (x < wa.Left) x = wa.Left;
+            int y = Top - h - 4;                                   // 默认弹在浮窗上方
+            if (y < wa.Top) { y = Top + Height + 4; if (y + h > wa.Bottom) y = wa.Top; }   // 上方放不下就放下方
+            flyout.Location = new Point(x, y);
+        }
+        void HideFlyout() { try { if (flyout != null && flyout.Visible) flyout.Hide(); } catch { } }
+
+        // 点的是哪一块
+        string BlockAt(int x)
+        {
+            int bx = 0;
+            if (st.ShowCpu) { if (x < bx + BW) return "cpu"; bx += BW; }
+            if (st.ShowMem) { if (x < bx + BW) return "mem"; bx += BW; }
+            if (st.ShowNet) { if (x < bx + BWNET) return "net"; bx += BWNET; }
+            if (st.ShowDisk) { if (x < bx + BWNET) return "disk"; bx += BWNET; }
+            foreach (string k in TempKeys) { if (ShowTemp(k)) { if (x < bx + BW) return k; bx += BW; } }
+            return null;
+        }
+        void HandleClick(int x)
+        {
+            string key = BlockAt(x);
+            if (key == null) return;
+            if (key == "net") { ShowTraffic(); return; }
+            if (st.CollapseTemps && key == st.MainTemp) ToggleFlyout();
+        }
+        void ShowTraffic()
+        {
+            HideFlyout();
+            try { using (TrafficForm f = new TrafficForm()) f.ShowDialog(this); } catch { }
             Invalidate();
         }
 
@@ -820,12 +965,12 @@ namespace RayRadar
                 { g.DrawString(diskOk ? ("读 " + Fmt(rdK)) : "硬盘", fNet, b, new RectangleF(x, 0, BWNET, 20), sf); g.DrawString(diskOk ? ("写 " + Fmt(wrK)) : "不可用", fNet, b, new RectangleF(x, 20, BWNET, 20), sf); }
                 x += BWNET;
             }
-            if (st.ShowCpuTemp) { Block(g, x, sk[idx++ % 3], "CPU", T(temp == null ? -1000 : temp.Cpu), fg, sf); x += BW; }
-            if (st.ShowGpuTemp) { Block(g, x, sk[idx++ % 3], "显卡", T(temp == null ? -1000 : temp.Gpu), fg, sf); x += BW; }
-            if (st.ShowGpuHot) { Block(g, x, sk[idx++ % 3], "热点", T(temp == null ? -1000 : temp.Hot), fg, sf); x += BW; }
-            if (st.ShowBoardTemp) { Block(g, x, sk[idx++ % 3], "主板", T(temp == null ? -1000 : temp.Board), fg, sf); x += BW; }
-            if (st.ShowDiskTemp) { Block(g, x, sk[idx++ % 3], "硬盘", T(temp == null ? -1000 : temp.Disk), fg, sf); x += BW; }
-            if (st.ShowDimmtemp) { Block(g, x, sk[idx++ % 3], "内存", T(temp == null ? -1000 : temp.Dimm), fg, sf); x += BW; }
+            if (ShowTemp("CPU")) { Block(g, x, sk[idx++ % 3], "CPU", T(TempVal("CPU")), fg, sf); x += BW; }
+            if (ShowTemp("GPU")) { Block(g, x, sk[idx++ % 3], "显卡", T(TempVal("GPU")), fg, sf); x += BW; }
+            if (ShowTemp("Hot")) { Block(g, x, sk[idx++ % 3], "热点", T(TempVal("Hot")), fg, sf); x += BW; }
+            if (ShowTemp("Board")) { Block(g, x, sk[idx++ % 3], "主板", T(TempVal("Board")), fg, sf); x += BW; }
+            if (ShowTemp("Disk")) { Block(g, x, sk[idx++ % 3], "硬盘", T(TempVal("Disk")), fg, sf); x += BW; }
+            if (ShowTemp("Dimm")) { Block(g, x, sk[idx++ % 3], "内存", T(TempVal("Dimm")), fg, sf); x += BW; }
         }
         void Fill(Graphics g, int x, int w, Color c) { using (SolidBrush b = new SolidBrush(c)) g.FillRectangle(b, new Rectangle(x, 0, w, BH)); }
         void Block(Graphics g, int x, Color bg, string cap, string val, Color fg, StringFormat sf)
@@ -942,6 +1087,26 @@ namespace RayRadar
             Chk("硬盘温度", 18, y + 96, st.ShowDiskTemp, delegate(bool v) { st.ShowDiskTemp = v; owner.ApplySettings(); });
             Chk("内存温度", 210, y + 96, st.ShowDimmtemp, delegate(bool v) { st.ShowDimmtemp = v; owner.ApplySettings(); });
             y += 122;
+
+            y = Toggle("温度折叠（只显示主温度）", y, st.CollapseTemps, delegate(bool v) { st.CollapseTemps = v; owner.ApplySettings(); });
+            Lbl("主温度", 18, y + 6);
+            ComboBox cbMain = new ComboBox();
+            cbMain.DropDownStyle = ComboBoxStyle.DropDownList;
+            cbMain.Items.AddRange(new object[] { "CPU", "显卡", "热点", "主板", "硬盘", "内存" });
+            string[] mkeys = new string[] { "CPU", "GPU", "Hot", "Board", "Disk", "Dimm" };
+            int mi = Array.IndexOf(mkeys, st.MainTemp); if (mi < 0) mi = 0;
+            cbMain.SelectedIndex = mi;
+            cbMain.Location = new Point(92, y + 3); cbMain.Width = 96;
+            cbMain.SelectedIndexChanged += delegate { st.MainTemp = mkeys[cbMain.SelectedIndex]; owner.ApplySettings(); };
+            scroll.Controls.Add(cbMain);
+            y += 30;
+
+            Label hint2 = new Label();
+            hint2.AutoSize = false; hint2.Size = new Size(378, 34); hint2.ForeColor = Color.Gray;
+            hint2.Text = "点浮窗上的「网速」块 → 流量统计；点「主温度」块 → 在上方展开其它温度（只显示这里勾选过的）。";
+            hint2.Location = new Point(18, y);
+            scroll.Controls.Add(hint2);
+            y += 38;
 
             Label lbAl = new Label(); lbAl.Text = "温度报警"; lbAl.ForeColor = Color.FromArgb(200, 30, 30); lbAl.Location = new Point(18, y); lbAl.AutoSize = true;
             scroll.Controls.Add(lbAl);
@@ -1077,5 +1242,233 @@ namespace RayRadar
             scroll.Controls.Add(n);
         }
     }
+    // ===== 流量统计：按天累计（只统计 Ray雷达 运行期间；Windows 本身不提供按天历史）=====
+    public static class Traffic
+    {
+        public static string FilePath { get { return Path.Combine(Settings.DirPath, "traffic.dat"); } }
+        static Dictionary<string, long[]> days = new Dictionary<string, long[]>();
+        static bool loaded = false;
+
+        public static void Load()
+        {
+            try
+            {
+                days.Clear();
+                if (File.Exists(FilePath))
+                {
+                    foreach (string line in File.ReadAllLines(FilePath))
+                    {
+                        string[] p = line.Split('\t');
+                        if (p.Length < 3) continue;
+                        long rx, tx;
+                        if (!long.TryParse(p[1], out rx) || !long.TryParse(p[2], out tx)) continue;
+                        days[p[0]] = new long[] { rx, tx };
+                    }
+                }
+            }
+            catch { }
+            loaded = true;
+        }
+        public static void Add(long rx, long tx)
+        {
+            if (!loaded) Load();
+            string k = DateTime.Now.ToString("yyyy-MM-dd");
+            long[] v;
+            if (!days.TryGetValue(k, out v)) { v = new long[2]; days[k] = v; }
+            v[0] += rx; v[1] += tx;
+        }
+        public static void Save()
+        {
+            try
+            {
+                Directory.CreateDirectory(Settings.DirPath);
+                List<string> keys = new List<string>(days.Keys); keys.Sort();
+                List<string> lines = new List<string>();
+                foreach (string k in keys) lines.Add(k + "\t" + days[k][0] + "\t" + days[k][1]);
+                File.WriteAllLines(FilePath, lines.ToArray());
+            }
+            catch { }
+        }
+        public static DateTime FirstDay()
+        {
+            if (!loaded) Load();
+            DateTime first = DateTime.MaxValue;
+            foreach (string k in days.Keys)
+            {
+                DateTime d;
+                if (DateTime.TryParse(k, out d) && d < first) first = d;
+            }
+            return first == DateTime.MaxValue ? DateTime.MinValue : first;
+        }
+        public static void Sum(int backDays, out long rx, out long tx)
+        {
+            if (!loaded) Load();
+            rx = 0; tx = 0;
+            DateTime today = DateTime.Today, from = today.AddDays(-(backDays - 1));
+            foreach (KeyValuePair<string, long[]> kv in days)
+            {
+                DateTime d;
+                if (!DateTime.TryParse(kv.Key, out d)) continue;
+                if (d.Date < from || d.Date > today) continue;
+                rx += kv.Value[0]; tx += kv.Value[1];
+            }
+        }
+        public static List<KeyValuePair<string, long[]>> Recent(int n)
+        {
+            if (!loaded) Load();
+            List<KeyValuePair<string, long[]>> list = new List<KeyValuePair<string, long[]>>();
+            DateTime today = DateTime.Today;
+            for (int i = 0; i < n; i++)
+            {
+                string k = today.AddDays(-i).ToString("yyyy-MM-dd");
+                long[] v;
+                if (days.TryGetValue(k, out v)) list.Add(new KeyValuePair<string, long[]>(k, v));
+            }
+            return list;
+        }
+        public static string Size(long bytes)
+        {
+            double g = bytes / 1073741824.0;
+            if (g >= 1) return g.ToString("0.00", CultureInfo.InvariantCulture) + " GB";
+            double m = bytes / 1048576.0;
+            if (m >= 1) return m.ToString("0.0", CultureInfo.InvariantCulture) + " MB";
+            return (bytes / 1024.0).ToString("0", CultureInfo.InvariantCulture) + " KB";
+        }
+    }
+
+    // 流量统计窗口（点浮窗上的「网速块」打开）
+    public class TrafficForm : Form
+    {
+        public TrafficForm()
+        {
+            Text = "Ray雷达 - 流量统计";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(430, 392);
+            Font = new Font("Microsoft YaHei UI", 9f);
+            TopMost = true;
+
+            Label head = new Label();
+            head.AutoSize = false; head.Size = new Size(400, 22);
+            head.Font = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold);
+            head.Text = "流量统计　↓ 下行　↑ 上行";
+            head.Location = new Point(14, 12);
+            Controls.Add(head);
+
+            DateTime first = Traffic.FirstDay();
+            Label sub = new Label();
+            sub.AutoSize = false; sub.Size = new Size(400, 34);
+            sub.ForeColor = Color.Gray;
+            sub.Text = first == DateTime.MinValue
+                ? "暂无数据：Ray雷达 只在运行时统计流量，从今天开始累计。"
+                : "统计起始 " + first.ToString("yyyy-MM-dd") + "　（只统计 Ray雷达 运行期间，按天累计；Windows 不提供按天历史）";
+            sub.Location = new Point(14, 38);
+            Controls.Add(sub);
+
+            int y = 78;
+            y = Row("今天（最近 1 天）", 1, y);
+            y = Row("最近 30 天", 30, y);
+            y = Row("最近 1 年", 365, y);
+
+            Label lb = new Label();
+            lb.Text = "最近 14 天明细"; lb.Location = new Point(14, y + 6); lb.AutoSize = true; lb.ForeColor = Color.Gray;
+            Controls.Add(lb);
+            y += 26;
+
+            ListView lv = new ListView();
+            lv.View = View.Details; lv.FullRowSelect = true; lv.HeaderStyle = ColumnHeaderStyle.Nonclickable;
+            lv.Location = new Point(14, y); lv.Size = new Size(402, 146);
+            lv.Columns.Add("日期", 112); lv.Columns.Add("下行", 95); lv.Columns.Add("上行", 95); lv.Columns.Add("合计", 95);
+            Controls.Add(lv);
+            foreach (KeyValuePair<string, long[]> kv in Traffic.Recent(14))
+            {
+                ListViewItem it = new ListViewItem(kv.Key);
+                it.SubItems.Add(Traffic.Size(kv.Value[0]));
+                it.SubItems.Add(Traffic.Size(kv.Value[1]));
+                it.SubItems.Add(Traffic.Size(kv.Value[0] + kv.Value[1]));
+                lv.Items.Add(it);
+            }
+
+            Button ok = new Button();
+            ok.Text = "知道了"; ok.Size = new Size(100, 28);
+            ok.Location = new Point((ClientSize.Width - 100) / 2, ClientSize.Height - 38);
+            ok.Click += delegate { Close(); };
+            Controls.Add(ok);
+            AcceptButton = ok;
+        }
+
+        int Row(string label, int backDays, int y)
+        {
+            long rx, tx;
+            Traffic.Sum(backDays, out rx, out tx);
+            Label l = new Label();
+            l.Text = label; l.Location = new Point(14, y); l.AutoSize = true;
+            Controls.Add(l);
+            Label v = new Label();
+            v.Text = "↓ " + Traffic.Size(rx) + "　↑ " + Traffic.Size(tx) + "　合计 " + Traffic.Size(rx + tx);
+            v.Location = new Point(150, y); v.AutoSize = true;
+            v.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold);
+            Controls.Add(v);
+            return y + 26;
+        }
+    }
+
+    // 温度展开浮层（点主温度块时弹在浮窗上方；只显示设置里勾选、且不是主温度的那些）
+    public class TempFlyout : Form
+    {
+        RadarForm owner;
+        public TempFlyout(RadarForm o)
+        {
+            owner = o;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false; StartPosition = FormStartPosition.Manual;
+            Text = "Ray雷达温度"; DoubleBuffered = true;
+            TopMost = true;
+        }
+        public void Rebuild()
+        {
+            int n = owner.FlyoutItems().Count;
+            if (n < 1) n = 1;
+            ClientSize = new Size(n * 40, 40);
+            ApplyTopMost();
+            Invalidate();
+        }
+        // 与主浮窗同样的置顶写法（直接 SetWindowPos 无效，必须切 WinForms 的 TopMost）
+        public void ApplyTopMost()
+        {
+            try
+            {
+                if (!IsHandleCreated) return;
+                if (TopMost) TopMost = false;
+                TopMost = true;
+            }
+            catch { }
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            List<string[]> items = owner.FlyoutItems();
+            Color[] sk = owner.SkinColors();
+            Color fg = owner.FgColor();
+            Graphics g = e.Graphics;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            StringFormat sf = new StringFormat();
+            sf.Alignment = StringAlignment.Center; sf.LineAlignment = StringAlignment.Center;
+            int x = 0, i = 0;
+            foreach (string[] it in items)
+            {
+                using (SolidBrush b = new SolidBrush(sk[i % 3])) g.FillRectangle(b, new Rectangle(x, 0, 40, 40));
+                i++;
+                using (SolidBrush b = new SolidBrush(fg))
+                {
+                    g.DrawString(it[0], owner.CapFont, b, new RectangleF(x, 1, 40, 15), sf);
+                    g.DrawString(it[1], owner.ValFont, b, new RectangleF(x, 17, 40, 22), sf);
+                }
+                x += 40;
+            }
+        }
+        protected override void OnClick(EventArgs e) { base.OnClick(e); Hide(); }   // 点浮层本身即收起
+    }
+
     public delegate void ChangerInt(int v);
 }
