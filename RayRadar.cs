@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -462,24 +462,54 @@ namespace RayRadar
 
     public class AlertForm : Form
     {
-        public AlertForm(string title, List<string> lines)
+        // 按内容自动换行排版：长句不再被窗口右侧裁掉（用户 2026-09-18 反馈）
+        public AlertForm(string title, List<string> lines, string hint)
         {
             Text = title;
             FormBorderStyle = FormBorderStyle.FixedToolWindow;
             StartPosition = FormStartPosition.CenterScreen;
             TopMost = true; ShowInTaskbar = true; MaximizeBox = false; MinimizeBox = false;
-            ClientSize = new Size(430, 90 + lines.Count * 26);
             Font = new Font("Microsoft YaHei UI", 10f);
+
+            const int pad = 20, gap = 8;
+            int width = 490, textW = width - pad * 2;
+            Font fHead = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold);
+            Font fBody = new Font("Microsoft YaHei UI", 10f);
+            Font fHint = new Font("Microsoft YaHei UI", 9f);
+
             Label head = new Label();
-            head.Text = "⚠ 温度报警"; head.Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold);
-            head.ForeColor = Color.FromArgb(200, 30, 30); head.Location = new Point(18, 14); head.AutoSize = true;
+            head.Text = "⚠ 温度报警"; head.Font = fHead;
+            head.ForeColor = Color.FromArgb(200, 30, 30);
+            head.Location = new Point(pad - 2, 14); head.AutoSize = true;
             Controls.Add(head);
+
             int y = 52;
             foreach (string l in lines)
             {
-                Label lb = new Label(); lb.Text = l; lb.Location = new Point(20, y); lb.AutoSize = true;
-                Controls.Add(lb); y += 26;
+                if (l == null || l.Length == 0) { y += 6; continue; }
+                Size sz = TextRenderer.MeasureText(l, fBody, new Size(textW, 2000), TextFormatFlags.WordBreak);
+                Label lb = new Label();
+                lb.AutoSize = false; lb.Font = fBody; lb.Text = l;
+                lb.Location = new Point(pad, y);
+                lb.Size = new Size(textW, Math.Max(20, sz.Height + 4));
+                lb.ForeColor = Color.FromArgb(30, 30, 30);
+                Controls.Add(lb);
+                y += lb.Height + gap;
             }
+            if (!string.IsNullOrEmpty(hint))
+            {
+                y += 2;
+                Size sz = TextRenderer.MeasureText(hint, fHint, new Size(textW, 2000), TextFormatFlags.WordBreak);
+                Label lb = new Label();
+                lb.AutoSize = false; lb.Font = fHint; lb.Text = hint;
+                lb.Location = new Point(pad, y);
+                lb.Size = new Size(textW, Math.Max(18, sz.Height + 4));
+                lb.ForeColor = Color.FromArgb(110, 112, 118);
+                Controls.Add(lb);
+                y += lb.Height + gap;
+            }
+
+            ClientSize = new Size(width, y + 50);
             Button ok = new Button();
             ok.Text = "知道了"; ok.Size = new Size(110, 30);
             ok.Location = new Point((ClientSize.Width - 110) / 2, ClientSize.Height - 42);
@@ -517,6 +547,9 @@ namespace RayRadar
         TempFlyout flyout;
         Point downPt; bool downLeft = false;
         bool suppressClick = false;          // 双击后抑制紧随的 MouseUp
+        readonly DateTime startedAt = DateTime.Now;   // 程序启动时刻（温升报警预热用）
+        const double RiseWarmupSeconds = 180;         // 启动后 3 分钟内不判温升（开机温度本身在爬升）
+        const float RiseFloorC = 45f;                 // 温升报警还要求当前温度 ≥ 45°C，避免低温区的无意义波动
         int flushTick = 0;
 
         public RadarForm(Settings s)
@@ -612,18 +645,22 @@ namespace RayRadar
             if (st.AlarmRise && temp.Cpu > -900)
             {
                 DateTime now = DateTime.Now;
+                // 采样中断（睡眠唤醒 / 程序被挂起）就重新开始积累，避免跨空档算出假温升
+                if (cpuHist.Count > 0 && (now - cpuHist[cpuHist.Count - 1].Key).TotalSeconds > 8) cpuHist.Clear();
                 cpuHist.Add(new KeyValuePair<DateTime, float>(now, temp.Cpu));
                 while (cpuHist.Count > 0 && (now - cpuHist[0].Key).TotalSeconds > 20) cpuHist.RemoveAt(0);
-                if (cpuHist.Count > 1)
+                // 刚开机/刚启动时 CPU 温度本身就在爬升，预热期内不判温升（2026-09-18 用户反馈开机即误报）
+                bool warm = (now - startedAt).TotalSeconds >= RiseWarmupSeconds;
+                if (warm && cpuHist.Count > 2)
                 {
                     float rise = temp.Cpu - cpuHist[0].Value;
-                    if (rise >= st.RiseLimit)
+                    if (rise >= st.RiseLimit && temp.Cpu >= RiseFloorC)
                     {
                         DateTime last;
                         if (!(lastAlarm.TryGetValue("rise", out last) && (DateTime.Now - last).TotalMinutes < 5))
                         {
                             lastAlarm["rise"] = now;
-                            msgs.Add("CPU 温度 20 秒内上升 " + ((int)Math.Round(rise)) + "°C（阈值 " + st.RiseLimit + "°C）");
+                            msgs.Add("CPU 温度 20 秒内上升 " + ((int)Math.Round(rise)) + "°C（当前 " + ((int)Math.Round(temp.Cpu)) + "°C，阈值 " + st.RiseLimit + "°C）");
                             cpuHist.Clear();
                         }
                     }
@@ -633,10 +670,8 @@ namespace RayRadar
             if (msgs.Count == 0) return;
             if ((DateTime.Now - lastPopup).TotalSeconds < 60) return;
             lastPopup = DateTime.Now;
-            msgs.Add("");
-            msgs.Add("若为水冷/液冷：请检查水泵转速、水管接头是否渗漏、冷排风扇是否停转。");
             if (st.AlarmSound) { try { SystemSounds.Hand.Play(); } catch { } }
-            try { using (AlertForm f = new AlertForm("Ray雷达 · 温度报警", msgs)) f.ShowDialog(); } catch { }
+            try { using (AlertForm f = new AlertForm("Ray雷达 · 温度报警", msgs, "若为水冷/液冷：请检查水泵转速、水管接头是否渗漏、冷排风扇是否停转。")) f.ShowDialog(); } catch { }
         }
 
         public void ApplySettings()
