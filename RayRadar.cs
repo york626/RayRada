@@ -788,8 +788,8 @@ namespace RayRadar
                     if (ip.IndexOf(':') >= 0) continue;                                        // 只看 IPv4
                     if (ip == "127.0.0.1" || ip == "0.0.0.0") continue;
                     if (st.SentinelSelf && ip == ListenIp) continue;                           // 本机自测放行
-                    string mac = MacOf(ip);
-                    if (wl.ContainsKey(ip.ToUpperInvariant())) continue;                        // IP 命中白名单
+                    if (wl.ContainsKey(ip.ToUpperInvariant())) continue;                        // IP 命中白名单（先判 IP，省掉白名单设备的 ARP 查询）
+                    string mac = MacOf(ip);                                                     // v4.14：ARP 放到 IP 判定之后
                     if (mac.Length > 0 && wl.ContainsKey(mac)) continue;                        // MAC 命中白名单
                     if (!ips.Contains(ip)) { ips.Add(ip); why.Add(mac.Length > 0 ? "MAC " + mac : "无 ARP 记录"); }
                 }
@@ -804,18 +804,88 @@ namespace RayRadar
                 lastAlarm[ip] = DateTime.Now;
                 SentinelHit h = new SentinelHit();
                 h.Ip = ip;
-                h.Mac = MacOf(ip);
                 h.Why = why[i];
-                LastOffender = h.Ip + (h.Mac.Length > 0 ? "," + h.Mac : "");
-                Log("⚠ 陌生设备连接入口：" + h.Ip + (h.Mac.Length > 0 ? "（MAC " + h.Mac + "）" : "") + " —— " + h.Why);
+                Log("⚠ 陌生设备连接入口：" + ip + " —— 立即阻断");
                 if (doBlock)
                 {
-                    h.Blocked = Block();
-                    Log(h.Blocked ? "已自动关闭手机入口（阻断 " + h.Ip + "）" : "⚠ 自动阻断失败（需要管理员权限）");
+                    int k = KillConnections(ip, ListenPort);   // 先切断对方已建立的连接（双保险）
+                    h.Blocked = Block();                       // 再删掉转发，让新连接也进不来
+                    h.Mac = MacOf(ip);                         // MAC 只为写日志，放在阻断之后（ARP 慢也不拖慢拦截）
+                    LastOffender = h.Ip + (h.Mac.Length > 0 ? "," + h.Mac : "");
+                    Log(h.Blocked
+                        ? ("已自动关闭手机入口并切断其连接（阻断 " + ip + "，切断 " + k.ToString() + " 条 TCP）")
+                        : "⚠ 自动阻断失败（需要管理员权限）");
+                }
+                else
+                {
+                    h.Mac = MacOf(ip);
+                    LastOffender = h.Ip + (h.Mac.Length > 0 ? "," + h.Mac : "");
                 }
                 hits.Add(h);
             }
             return hits;
+        }
+
+        // ===== v4.14：① 扫描挪到后台线程（界面永不卡） ② 阻断时顺手切断对方已建立的 TCP 连接 =====
+        static Thread worker = null;
+        static volatile bool workerStop = false;
+        public static int ScanMs = 500;                              // 扫描间隔（毫秒）
+        public static Action<List<SentinelHit>> OnHits = null;       // RadarForm 设置；内部会切回 UI 线程弹窗
+
+        public static void StartWorker(Settings st)
+        {
+            if (worker != null || st == null) return;
+            workerStop = false;
+            worker = new Thread(delegate()
+            {
+                while (!workerStop)
+                {
+                    try { Thread.Sleep(ScanMs); } catch { }
+                    if (workerStop) break;
+                    try
+                    {
+                        List<SentinelHit> hits = Scan(st, true);
+                        if (hits.Count > 0 && OnHits != null) OnHits(hits);
+                    }
+                    catch { }
+                }
+            });
+            worker.IsBackground = true;
+            try { worker.Start(); } catch { }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MIB_TCPROW
+        {
+            public int dwState, dwLocalAddr, dwLocalPort, dwRemoteAddr, dwRemotePort;
+        }
+
+        [DllImport("iphlpapi.dll")]
+        static extern int SetTcpEntry(ref MIB_TCPROW row);
+
+        static int NetPort(int p) { return ((p & 0xFF) << 8) | ((p >> 8) & 0xFF); }
+
+        // 强行切断某台设备在本机入口上的 TCP 连接（MIB_TCP_STATE_DELETE_TCB）——让它正在用的页面立刻断线
+        public static int KillConnections(string ip, int port)
+        {
+            int n = 0;
+            try
+            {
+                foreach (TcpConnectionInformation c in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpConnections())
+                {
+                    if (c.LocalEndPoint.Port != port) continue;
+                    if (c.RemoteEndPoint.Address.ToString() != ip) continue;
+                    MIB_TCPROW row = new MIB_TCPROW();
+                    row.dwState = 12;   // DELETE_TCB
+                    row.dwLocalAddr = BitConverter.ToInt32(c.LocalEndPoint.Address.GetAddressBytes(), 0);
+                    row.dwLocalPort = NetPort(c.LocalEndPoint.Port);
+                    row.dwRemoteAddr = BitConverter.ToInt32(c.RemoteEndPoint.Address.GetAddressBytes(), 0);
+                    row.dwRemotePort = NetPort(c.RemoteEndPoint.Port);
+                    if (SetTcpEntry(ref row) == 0) n++;
+                }
+            }
+            catch { }
+            return n;
         }
     }
 
@@ -876,7 +946,12 @@ namespace RayRadar
             pIdle = Native.U(i); pTot = Native.U(k) + Native.U(u);
             timer = new System.Windows.Forms.Timer(); timer.Interval = 1000; timer.Tick += new EventHandler(OnTick); timer.Start();
             tempTimer = new System.Windows.Forms.Timer(); tempTimer.Interval = 3000; tempTimer.Tick += new EventHandler(OnTempTick); tempTimer.Start();
-            Shown += delegate { ApplyTopMost(); OnTempTick(null, null); };
+            Shown += delegate
+            {
+                ApplyTopMost(); OnTempTick(null, null);
+                LanSentinel.OnHits = OnSentinelHits;   // v4.14：哨兵在后台线程扫描，命中后切回 UI 线程弹窗
+                LanSentinel.StartWorker(st);
+            };
             try { Traffic.Load(); } catch { }
             FormClosing += delegate { try { Traffic.Save(); } catch { } HideFlyout(); };
         }
@@ -1173,43 +1248,59 @@ namespace RayRadar
             { try { rdK = diskR.NextValue() / 1024.0; wrK = diskW.NextValue() / 1024.0; } catch { diskOk = false; } }
             if (++topTick >= 5) { topTick = 0; EnsureTopMost(); }
 
-            // v4.10：DSH 手机入口哨兵（每秒检查一次；没有 3081 转发时等于不做事）
-            if (st.Sentinel)
-            {
-                try
-                {
-                    List<SentinelHit> hits = LanSentinel.Scan(st, true);
-                    if (hits.Count > 0)
-                    {
-                        List<string> smsgs = new List<string>();
-                        foreach (SentinelHit h in hits)
-                        {
-                            smsgs.Add("陌生设备连接手机入口：" + h.Ip + (h.Mac.Length > 0 ? "（" + h.Mac + "）" : "")
-                                + (h.Blocked ? "，已自动关闭入口" : "，⚠ 阻断失败，请手动运行『关闭手机入口.cmd』"));
-                        }
-                        if (st.AlarmSound) { try { SystemSounds.Hand.Play(); } catch { } }
-                        try
-                        {
-                            using (AlertForm f = new AlertForm("Ray雷达 · 入口拦截", smsgs,
-                                "「重开手机入口」只是把入口开回来：白名单里的设备能进，陌生设备照样会被拦。若是自家设备被误拦，请先在设置里把它加进白名单再重开。",
-                                "⚠ 陌生设备接入", "保持关闭", "重开手机入口"))
-                            {
-                                f.ShowDialog();
-                                if (f.AltClicked)
-                                {
-                                    string rr = LanSentinel.OpenEntry();
-                                    MessageBox.Show(rr, "Ray雷达 · 手机入口", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                                }
-                            }
-                        }
-                        catch { }
-                    }
-                }
-                catch { }
-            }
+            // v4.14：DSH 手机入口哨兵已挪到后台线程（LanSentinel.StartWorker），界面线程不再做 netsh/ARP，
+            // 所以浮窗不会再被扫描卡住；命中后由 OnSentinelHits 切回 UI 线程弹非模态窗。
 
             Invalidate();
             if (flyout != null && flyout.Visible) flyout.Invalidate();
+        }
+
+        // ===== v4.14：入口拦截弹窗（非模态，不冻结浮窗）=====
+        static AlertForm sentinelAlert = null;   // 同一时间只留一个拦截弹窗
+
+        void OnSentinelHits(List<SentinelHit> hits)
+        {
+            try
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                BeginInvoke((MethodInvoker)delegate { ShowSentinelAlert(hits); });   // 从后台线程切回 UI 线程
+            }
+            catch { }
+        }
+
+        void ShowSentinelAlert(List<SentinelHit> hits)
+        {
+            try
+            {
+                if (sentinelAlert != null && !sentinelAlert.IsDisposed) return;      // 已经有一个在显示，不再堆叠
+                List<string> smsgs = new List<string>();
+                foreach (SentinelHit h in hits)
+                {
+                    smsgs.Add("陌生设备连接手机入口：" + h.Ip + (h.Mac.Length > 0 ? "（" + h.Mac + "）" : "")
+                        + (h.Blocked ? "，已自动关闭入口并切断连接" : "，⚠ 阻断失败，请手动运行『关闭手机入口.cmd』"));
+                }
+                if (st.AlarmSound) { try { SystemSounds.Hand.Play(); } catch { } }
+                AlertForm f = new AlertForm("Ray雷达 · 入口拦截", smsgs,
+                    "「重开手机入口」只是把入口开回来：白名单里的设备能进，陌生设备照样会被拦。若是自家设备被误拦，请先在设置里把它加进白名单再重开。",
+                    "⚠ 陌生设备接入", "保持关闭", "重开手机入口");
+                sentinelAlert = f;
+                f.FormClosed += delegate
+                {
+                    sentinelAlert = null;
+                    try
+                    {
+                        if (f.AltClicked)
+                        {
+                            string rr = LanSentinel.OpenEntry();
+                            MessageBox.Show(rr, "Ray雷达 · 手机入口", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                    }
+                    catch { }
+                    try { f.Dispose(); } catch { }
+                };
+                f.Show();   // 非模态：浮窗继续刷新，哨兵继续扫描
+            }
+            catch { }
         }
 
         // ===== 温度块：哪些显示在浮窗上 / 哪些放进展开浮层 =====
