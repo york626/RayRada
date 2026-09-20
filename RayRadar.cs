@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -8,6 +8,8 @@ using System.Media;
 using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -212,6 +214,10 @@ namespace RayRadar
         public string MainTemp = "CPU";            // 主温度键：CPU/GPU/Hot/Board/Disk/Dimm
         public bool Alarm = true, AlarmSound = true, AlarmRise = true;
         public int LimCpu = 90, LimGpu = 85, LimHot = 95, LimBoard = 65, LimDisk = 75, LimDimm = 60, RiseLimit = 15;
+        // v4.10「DSH 手机入口哨兵」：只有本机存在 3081 端口转发（手机入口）时才实际工作
+        public bool Sentinel = true;             // 总开关（默认开；没有 3081 入口时等于不做事）
+        public bool SentinelSelf = true;         // 放行本机自测连接（自测拦截效果时可临时关掉）
+        public string SentinelWhitelist = "";    // 逗号分隔的 IP/MAC（MAC 写法 82-8B-68-6C-2F-FF）
 
         public static string DirPath { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RayRadar"); } }
         public static string FilePath { get { return Path.Combine(DirPath, "settings.ini"); } }
@@ -263,6 +269,9 @@ namespace RayRadar
                         case "DriverAsk": s.DriverAsk = b; break;
                         case "CollapseTemps": s.CollapseTemps = b; break;
                         case "MainTemp": s.MainTemp = v; break;
+                        case "Sentinel": s.Sentinel = b; break;
+                        case "SentinelSelf": s.SentinelSelf = b; break;
+                        case "SentinelWhitelist": s.SentinelWhitelist = v; break;
                     }
                 }
             }
@@ -286,6 +295,7 @@ namespace RayRadar
                 ai("LimCpu", LimCpu); ai("LimGpu", LimGpu); ai("LimHot", LimHot); ai("LimBoard", LimBoard); ai("LimDisk", LimDisk); ai("LimDimm", LimDimm); ai("RiseLimit", RiseLimit);
                 ab("AutoStart", AutoStart); ab("DriverAsk", DriverAsk);
                 ab("CollapseTemps", CollapseTemps); L.Add("MainTemp=" + MainTemp);
+                ab("Sentinel", Sentinel); ab("SentinelSelf", SentinelSelf); L.Add("SentinelWhitelist=" + SentinelWhitelist);
                 File.WriteAllLines(FilePath, L.ToArray());
             }
             catch { }
@@ -522,6 +532,168 @@ namespace RayRadar
 namespace RayRadar
 {
     using LibreHardwareMonitor.Hardware;
+
+    // ===== v4.10：DSH 手机入口哨兵 =====
+    // 只有本机存在 3081 端口转发（= 开了手机入口）时才实际工作：
+    // 监控该入口上的连接，白名单之外的设备一律「提示音 + 弹窗 + 删掉转发（阻断）」。
+    // 对别人无害：没有 3081 转发的电脑，这个模块什么都不做。
+    public class SentinelHit
+    {
+        public string Ip = "";
+        public string Mac = "";
+        public string Why = "";
+        public bool Blocked = false;
+    }
+
+    public static class LanSentinel
+    {
+        public static string ListenIp = "";
+        public static int ListenPort = 0;
+        public static string LastOffender = "";      // "IP,MAC" —— 设置窗口「加入上次拦截」用
+        static DateTime entryCheckedAt = DateTime.MinValue;
+        static bool wasUp = false;
+        static readonly Dictionary<string, DateTime> lastAlarm = new Dictionary<string, DateTime>();
+
+        public static string LogPath { get { return Path.Combine(Settings.DirPath, "sentinel.log"); } }
+
+        public static void Log(string m)
+        {
+            try
+            {
+                Directory.CreateDirectory(Settings.DirPath);
+                File.AppendAllText(LogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + m + "\r\n", Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        // 每 10 秒查一次 portproxy（少起进程）
+        public static bool RefreshEntry()
+        {
+            if ((DateTime.Now - entryCheckedAt).TotalSeconds < 10) return ListenPort > 0;
+            entryCheckedAt = DateTime.Now;
+            ListenIp = ""; ListenPort = 0;
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo("netsh.exe", "interface portproxy show v4tov4");
+                psi.UseShellExecute = false; psi.CreateNoWindow = true; psi.RedirectStandardOutput = true;
+                System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi);
+                string outp = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(5000);
+                foreach (string line in outp.Split('\n'))
+                {
+                    Match mm = Regex.Match(line, @"(\d{1,3}(?:\.\d{1,3}){3})\s+(\d+)\s+127\.0\.0\.1\s+(\d+)");
+                    if (mm.Success)
+                    {
+                        ListenIp = mm.Groups[1].Value;
+                        ListenPort = int.Parse(mm.Groups[2].Value);
+                        break;
+                    }
+                }
+            }
+            catch { }
+            if (ListenPort > 0 && !wasUp) { wasUp = true; Log("哨兵已启用：监控 " + ListenIp + ":" + ListenPort.ToString() + "（白名单命中即放行，其余报警并阻断）"); }
+            if (ListenPort <= 0 && wasUp) { wasUp = false; Log("入口未开启（portproxy 里没有 3081 转发），哨兵待机"); }
+            return ListenPort > 0;
+        }
+
+        // 关掉入口：删掉这条转发（需要管理员 —— Ray雷达本来就是管理员运行）
+        public static bool Block()
+        {
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo("netsh.exe",
+                    "interface portproxy delete v4tov4 listenaddress=" + ListenIp + " listenport=" + ListenPort.ToString());
+                psi.UseShellExecute = false; psi.CreateNoWindow = true;
+                System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi);
+                p.WaitForExit(5000);
+                bool ok = (p.ExitCode == 0);
+                entryCheckedAt = DateTime.MinValue;      // 下一拍立刻重新探测
+                return ok;
+            }
+            catch { return false; }
+        }
+
+        [DllImport("iphlpapi.dll")]
+        static extern int SendARP(int dest, int src, byte[] mac, ref int len);
+
+        // 取对端 MAC（同网段直连才有值；自己连自己时为空，正常）
+        public static string MacOf(string ip)
+        {
+            try
+            {
+                System.Net.IPAddress a;
+                if (!System.Net.IPAddress.TryParse(ip, out a)) return "";
+                byte[] mac = new byte[6]; int len = mac.Length;
+                if (SendARP(BitConverter.ToInt32(a.GetAddressBytes(), 0), 0, mac, ref len) != 0) return "";
+                string[] h = new string[6];
+                for (int i = 0; i < 6; i++) h[i] = mac[i].ToString("X2");
+                return string.Join("-", h);
+            }
+            catch { return ""; }
+        }
+
+        static Dictionary<string, bool> ParseIps(string s)
+        {
+            Dictionary<string, bool> d = new Dictionary<string, bool>();
+            string src = (s == null) ? "" : s;
+            foreach (string part in src.Split(new char[] { ',', ';', ' ', '\r', '\n', '\t' }))
+            {
+                string t = part.Trim();
+                if (t.Length > 0) d[t.ToUpperInvariant()] = true;
+            }
+            return d;
+        }
+
+        // 每 1 秒调一次（OnTick）；返回本次命中的陌生设备
+        public static List<SentinelHit> Scan(Settings st, bool doBlock)
+        {
+            List<SentinelHit> hits = new List<SentinelHit>();
+            if (st == null || !st.Sentinel) return hits;
+            if (!RefreshEntry() || ListenPort <= 0) return hits;
+
+            Dictionary<string, bool> wl = ParseIps(st.SentinelWhitelist);
+            List<string> ips = new List<string>();
+            List<string> why = new List<string>();
+            try
+            {
+                foreach (TcpConnectionInformation c in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpConnections())
+                {
+                    if (c.LocalEndPoint.Port != ListenPort) continue;
+                    if (c.State != TcpState.Established && c.State != TcpState.TimeWait && c.State != TcpState.CloseWait) continue;
+                    string ip = c.RemoteEndPoint.Address.ToString();
+                    if (ip.IndexOf(':') >= 0) continue;                                        // 只看 IPv4
+                    if (ip == "127.0.0.1" || ip == "0.0.0.0") continue;
+                    if (st.SentinelSelf && ip == ListenIp) continue;                           // 本机自测放行
+                    string mac = MacOf(ip);
+                    if (wl.ContainsKey(ip.ToUpperInvariant())) continue;                        // IP 命中白名单
+                    if (mac.Length > 0 && wl.ContainsKey(mac)) continue;                        // MAC 命中白名单
+                    if (!ips.Contains(ip)) { ips.Add(ip); why.Add(mac.Length > 0 ? "MAC " + mac : "无 ARP 记录"); }
+                }
+            }
+            catch { }
+
+            for (int i = 0; i < ips.Count; i++)
+            {
+                string ip = ips[i];
+                DateTime last;
+                if (lastAlarm.TryGetValue(ip, out last) && (DateTime.Now - last).TotalSeconds < 60) continue;
+                lastAlarm[ip] = DateTime.Now;
+                SentinelHit h = new SentinelHit();
+                h.Ip = ip;
+                h.Mac = MacOf(ip);
+                h.Why = why[i];
+                LastOffender = h.Ip + (h.Mac.Length > 0 ? "," + h.Mac : "");
+                Log("⚠ 陌生设备连接入口：" + h.Ip + (h.Mac.Length > 0 ? "（MAC " + h.Mac + "）" : "") + " —— " + h.Why);
+                if (doBlock)
+                {
+                    h.Blocked = Block();
+                    Log(h.Blocked ? "已自动关闭手机入口（阻断 " + h.Ip + "）" : "⚠ 自动阻断失败（需要管理员权限）");
+                }
+                hits.Add(h);
+            }
+            return hits;
+        }
+    }
 
     public class RadarForm : Form
     {
@@ -876,6 +1048,34 @@ namespace RayRadar
             if (st.ShowDisk && diskOk)
             { try { rdK = diskR.NextValue() / 1024.0; wrK = diskW.NextValue() / 1024.0; } catch { diskOk = false; } }
             if (++topTick >= 5) { topTick = 0; EnsureTopMost(); }
+
+            // v4.10：DSH 手机入口哨兵（每秒检查一次；没有 3081 转发时等于不做事）
+            if (st.Sentinel)
+            {
+                try
+                {
+                    List<SentinelHit> hits = LanSentinel.Scan(st, true);
+                    if (hits.Count > 0)
+                    {
+                        List<string> smsgs = new List<string>();
+                        foreach (SentinelHit h in hits)
+                        {
+                            smsgs.Add("陌生设备连接手机入口：" + h.Ip + (h.Mac.Length > 0 ? "（" + h.Mac + "）" : "")
+                                + (h.Blocked ? "，已自动关闭入口" : "，⚠ 阻断失败，请手动运行『关闭手机入口.cmd』"));
+                        }
+                        if (st.AlarmSound) { try { SystemSounds.Hand.Play(); } catch { } }
+                        try
+                        {
+                            using (AlertForm f = new AlertForm("Ray雷达 · 入口拦截", smsgs,
+                                "要重新开放：运行『开放手机入口.cmd』。若是自家设备被误拦，在设置里把它的 IP/MAC 加进哨兵白名单（有『加入上次拦截』按钮）。"))
+                                f.ShowDialog();
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+
             Invalidate();
             if (flyout != null && flyout.Visible) flyout.Invalidate();
         }
@@ -1190,6 +1390,29 @@ namespace RayRadar
             Num("内存", 210, y + 56, st.LimDimm, delegate(int v) { st.LimDimm = v; });
             NumR("温升(20秒)", 18, y + 84, st.RiseLimit, 5, 60, delegate(int v) { st.RiseLimit = v; });
             y += 116;
+
+            Lbl("DSH 手机入口哨兵", 18, y + 4);
+            y += 26;
+            y = Toggle("监控 3081 手机入口（陌生设备报警并阻断）", y, st.Sentinel, delegate(bool v) { st.Sentinel = v; });
+            y = Toggle("放行本机自测连接", y, st.SentinelSelf, delegate(bool v) { st.SentinelSelf = v; });
+            TextBox tbWl = new TextBox();
+            tbWl.Text = st.SentinelWhitelist; tbWl.Font = new Font("Microsoft YaHei UI", 8f);
+            tbWl.Location = new Point(18, y + 3); tbWl.Width = 300;
+            tbWl.TextChanged += delegate { st.SentinelWhitelist = tbWl.Text; };
+            scroll.Controls.Add(tbWl);
+            Button btnWl = new Button();
+            btnWl.Text = "加入上次拦截"; btnWl.Font = new Font("Microsoft YaHei UI", 8f);
+            btnWl.Size = new Size(84, 24); btnWl.Location = new Point(322, y + 2);
+            btnWl.Click += delegate
+            {
+                if (LanSentinel.LastOffender.Length == 0) { MessageBox.Show("本次运行还没有拦截记录。", "Ray雷达", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+                string cur = tbWl.Text.Trim().TrimEnd(',');
+                tbWl.Text = (cur.Length == 0 ? "" : cur + ",") + LanSentinel.LastOffender;
+            };
+            scroll.Controls.Add(btnWl);
+            y += 30;
+            Hint2("白名单：逗号分隔的 IP 或 MAC（例 192.168.31.18,82-8B-68-6C-2F-FF）。只有本机开了 3081 转发时才生效；日志 %APPDATA%\\RayRadar\\sentinel.log", 18, y + 2);
+            y += 34;
 
             y = Toggle("开机自启", y, st.AutoStart, delegate(bool v) { st.AutoStart = v; Settings.ApplyAutoStart(v); });
 
