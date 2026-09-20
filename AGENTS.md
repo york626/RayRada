@@ -24,7 +24,11 @@ Windows 桌面硬件监控浮窗（C# WinForms，**单文件 exe**）。源码�
 3. `git add -A; git commit -m "vX.Y: …"`。
 4. 发版：`C:\Users\Ray\.dsh\tools\publish-rayrada.ps1 -Tag vX.Y`
    （本机 `github.com` 被 hosts 拦，脚本走 REST API 推进远端；不带 `-TokenFile` 会用 DPAPI 存好的 token）。
-5. **只改文档、不改 exe 的提交**（例如本文件）：用 **`-SkipRelease`** —— 它只推 main，不建 tag / Release。
+5. ⚠️ **发布后把本地 ref 对齐到远端 SHA**：脚本经 API 建的 commit 会**去掉消息结尾换行**，SHA 与本机 `git commit` 的**差一个字节**
+   （脚本打印的「SHA 不同（不影响使用）」是错的——不对齐时，下次提交的 parent 在远端不存在，`POST /git/commits` 会 **422**）。
+   做法：去掉本地 commit 对象末尾 `0x0A` → `git hash-object -t commit -w` → `git update-ref refs/heads/main <远端SHA>`；
+   完整命令见工作区 `docs/rayradar.md` §10（2026-09-19 实测可用）。
+6. **只改文档、不改 exe 的提交**（例如本文件）：用 **`-SkipRelease`** —— 它只推 main，不建 tag / Release（这一步仍要照第 5 条对齐 ref）。
 6. 版本号：`AssemblyVersion` / `AssemblyFileVersion` 一直是 `4.2.0.0`（历史遗留、未随版本更新）。**版本以 commit 消息 / `CHANGELOG.md` / Release tag 为准**。
 
 ## 4. 行为约束（用户明确要求过的，别改回去）
