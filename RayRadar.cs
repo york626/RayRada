@@ -473,7 +473,10 @@ namespace RayRadar
     public class AlertForm : Form
     {
         // 按内容自动换行排版：长句不再被窗口右侧裁掉（用户 2026-09-18 反馈）
-        public AlertForm(string title, List<string> lines, string hint)
+        public AlertForm(string title, List<string> lines, string hint) : this(title, lines, hint, null) { }
+
+        // headText：弹窗里那行红色大字。不传＝「温度报警」；入口拦截等其它报警自己传（v4.12 修：以前写死成温度报警）
+        public AlertForm(string title, List<string> lines, string hint, string headText)
         {
             Text = title;
             FormBorderStyle = FormBorderStyle.FixedToolWindow;
@@ -488,7 +491,7 @@ namespace RayRadar
             Font fHint = new Font("Microsoft YaHei UI", 9f);
 
             Label head = new Label();
-            head.Text = "⚠ 温度报警"; head.Font = fHead;
+            head.Text = string.IsNullOrEmpty(headText) ? "⚠ 温度报警" : headText; head.Font = fHead;
             head.ForeColor = Color.FromArgb(200, 30, 30);
             head.Location = new Point(pad - 2, 14); head.AutoSize = true;
             Controls.Add(head);
@@ -1169,7 +1172,8 @@ namespace RayRadar
                         try
                         {
                             using (AlertForm f = new AlertForm("Ray雷达 · 入口拦截", smsgs,
-                                "要重新开放：运行『开放手机入口.cmd』。若是自家设备被误拦，在设置里把它的 IP/MAC 加进哨兵白名单（有『加入上次拦截』按钮）。"))
+                                "要重新开放：右键浮窗 → 设置 →「重开手机入口」（不用管理员确认）。若是自家设备被误拦，点同一节里的「加入上次拦截」把它加进白名单。",
+                                "⚠ 陌生设备接入"))
                                 f.ShowDialog();
                         }
                         catch { }
