@@ -29,7 +29,7 @@ Windows 桌面硬件监控浮窗（C# WinForms，**单文件 exe**）。源码�
    做法：去掉本地 commit 对象末尾 `0x0A` → `git hash-object -t commit -w` → `git update-ref refs/heads/main <远端SHA>`；
    完整命令见工作区 `docs/rayradar.md` §10（2026-09-19 实测可用）。
 6. **只改文档、不改 exe 的提交**（例如本文件）：用 **`-SkipRelease`** —— 它只推 main，不建 tag / Release（这一步仍要照第 5 条对齐 ref）。
-6. 版本号：`AssemblyVersion` / `AssemblyFileVersion` 一直是 `4.2.0.0`（历史遗留、未随版本更新）。**版本以 commit 消息 / `CHANGELOG.md` / Release tag 为准**。
+7. 版本号：`AssemblyVersion` / `AssemblyFileVersion` 一直是 `4.2.0.0`（历史遗留、未随版本更新）。**版本以 commit 消息 / `CHANGELOG.md` / Release tag 为准**。
 
 ## 4. 行为约束（用户明确要求过的，别改回去）
 
@@ -38,6 +38,10 @@ Windows 桌面硬件监控浮窗（C# WinForms，**单文件 exe**）。源码�
 - 默认阈值：CPU 90 / 显卡 85 / 显卡热点 95 / 主板 65 / 硬盘 75 / 内存 60 °C；温升 15 °C/20 秒。
 - 温升报警有四层防误报：启动后 180 秒预热、当前温度须 ≥ 45 °C、采样间隔 > 8 秒清空历史、20 秒复测。**改动它们要同步更 `CHANGELOG.md` 并说明理由。**
 - 用户设置在 `%APPDATA%\RayRadar\settings.ini`：程序启动时读、变更时才写。**测试程序不要调 `Settings.Save()`**，以免覆盖用户设置。
+- **入口哨兵（v4.10 起）**：只在本机存在 **3081 端口转发**时才工作；白名单之外的设备一连上 ⇒ 报警 + **删掉转发** + **切断它已建立的 TCP**。
+  三条**别改回去**：① 扫描必须在**后台线程**（默认 500 毫秒）——放回界面线程会让浮窗卡住（v4.14 之前就是这样，用户实测反馈过）；
+  ② 拦截弹窗必须**非模态**（`Show()` 而不是 `ShowDialog()`，且同时只留一个）——模态窗会把浮窗冻住；
+  ③ 弹窗**只有「重开手机入口」和「保持关闭」两个按钮**，用户明确要求**不要**"顺手加白名单"按钮（白名单只在设置窗口里手动改）。
 
 ## 5. 测试装置（不加热 CPU 也能验报警）
 
@@ -50,9 +54,10 @@ Windows 桌面硬件监控浮窗（C# WinForms，**单文件 exe**）。源码�
 模拟器源码与用法：`C:\Users\Ray\Documents\DSH常用\_rayradar测试\`（含 `README.md` 与编译命令）。
 **2026-09-19 实测**：持续升温 → 第 42.1 秒弹窗；瞬时尖峰 → 静默不报。
 
-**入口哨兵的自测装置（v4.11 起）**：同目录 `SimEntry.cs` —— 直接调 `LanSentinel.LanIp()` / `OpenEntry()` / `CloseEntry()` / `StateText()`，
-验证「手机入口」的开/关逻辑（不显示浮窗、不读传感器）。⚠️ 它会**真的**增删 `netsh portproxy`，所以**必须用管理员运行**，
-跑完会自动恢复成「开启」并把过程写进同目录 `sim-entry.log`。编译命令见文件头（记得 `/codepage:65001`，否则中文字面量乱码）。
+**其它自测装置（共 4 个，源码 / 编译命令 / 实测结论见 `C:\Users\Ray\Documents\DSH常用\_rayradar测试\README.md`）**：
+`SimMain.cs`（温升报警，免管理员）、`SimEntry.cs`（手机入口开/关，**需管理员**，会真的增删 `netsh portproxy`、跑完自动恢复成「开启」）、
+`SimAlert.cs`（拦截弹窗的按钮结构，免管理员、只构造窗体不显示）、`SimKill.cs`（`SetTcpEntry` 切断连接，**需管理员**）。
+编译一律加 `/codepage:65001`（否则中文字面量乱码）；除需要真实温度的装置外**不要**嵌 `/resource:` 那 27 个 DLL。
 
 ## 6. 深入文档（本机）
 
