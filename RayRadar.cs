@@ -472,11 +472,17 @@ namespace RayRadar
 
     public class AlertForm : Form
     {
+        // 左边那个「动作」按钮被点了（v4.13：入口拦截弹窗用它做「重开手机入口」）
+        public bool AltClicked = false;
+
         // 按内容自动换行排版：长句不再被窗口右侧裁掉（用户 2026-09-18 反馈）
-        public AlertForm(string title, List<string> lines, string hint) : this(title, lines, hint, null) { }
+        public AlertForm(string title, List<string> lines, string hint) : this(title, lines, hint, null, null, null) { }
 
         // headText：弹窗里那行红色大字。不传＝「温度报警」；入口拦截等其它报警自己传（v4.12 修：以前写死成温度报警）
-        public AlertForm(string title, List<string> lines, string hint, string headText)
+        public AlertForm(string title, List<string> lines, string hint, string headText) : this(title, lines, hint, headText, null, null) { }
+
+        // okText：右下按钮（默认「知道了」）；altText：左下按钮（传了才出现，例如「重开手机入口」）
+        public AlertForm(string title, List<string> lines, string hint, string headText, string okText, string altText)
         {
             Text = title;
             FormBorderStyle = FormBorderStyle.FixedToolWindow;
@@ -523,12 +529,24 @@ namespace RayRadar
             }
 
             ClientSize = new Size(width, y + 50);
+            int bw = 110, bh = 30, bgap = 12;
+            bool two = (altText != null && altText.Length > 0);
+            int left = (ClientSize.Width - (two ? bw * 2 + bgap : bw)) / 2;
+            int top = ClientSize.Height - 42;
+            if (two)
+            {
+                Button alt = new Button();
+                alt.Text = altText; alt.Size = new Size(bw, bh); alt.Location = new Point(left, top);
+                alt.Click += delegate { AltClicked = true; Close(); };
+                Controls.Add(alt);
+            }
             Button ok = new Button();
-            ok.Text = "知道了"; ok.Size = new Size(110, 30);
-            ok.Location = new Point((ClientSize.Width - 110) / 2, ClientSize.Height - 42);
+            ok.Text = (okText == null || okText.Length == 0) ? "知道了" : okText;
+            ok.Size = new Size(bw, bh);
+            ok.Location = new Point(two ? left + bw + bgap : left, top);
             ok.Click += delegate { Close(); };
             Controls.Add(ok);
-            AcceptButton = ok;
+            AcceptButton = ok;      // 回车＝右边那个（入口拦截时是「保持关闭」，不会误触重开）
         }
     }
 }
@@ -702,7 +720,8 @@ namespace RayRadar
             if (fw.IndexOf("DSH Web LAN 3081") < 0)
                 RunNetsh("advfirewall firewall add rule name=\"DSH Web LAN 3081\" dir=in action=allow protocol=TCP localport=3081 remoteip=localsubnet", out fw);
             entryCheckedAt = DateTime.MinValue;
-            Log("已重开手机入口（设置窗）：" + ip + ":3081 → 127.0.0.1:3082");
+            lastAlarm.Clear();   // v4.13：重开入口后重新判定 —— 陌生设备立刻再拦一次，不享受 60 秒冷却
+            Log("已重开手机入口（手动）：" + ip + ":3081 → 127.0.0.1:3082");
             return "已开启：" + ip + ":3081 → 127.0.0.1:3082";
         }
 
@@ -1172,9 +1191,16 @@ namespace RayRadar
                         try
                         {
                             using (AlertForm f = new AlertForm("Ray雷达 · 入口拦截", smsgs,
-                                "要重新开放：右键浮窗 → 设置 →「重开手机入口」（不用管理员确认）。若是自家设备被误拦，点同一节里的「加入上次拦截」把它加进白名单。",
-                                "⚠ 陌生设备接入"))
+                                "「重开手机入口」只是把入口开回来：白名单里的设备能进，陌生设备照样会被拦。若是自家设备被误拦，请先在设置里把它加进白名单再重开。",
+                                "⚠ 陌生设备接入", "保持关闭", "重开手机入口"))
+                            {
                                 f.ShowDialog();
+                                if (f.AltClicked)
+                                {
+                                    string rr = LanSentinel.OpenEntry();
+                                    MessageBox.Show(rr, "Ray雷达 · 手机入口", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                                }
+                            }
                         }
                         catch { }
                     }
