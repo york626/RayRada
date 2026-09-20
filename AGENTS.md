@@ -51,13 +51,12 @@ Windows 桌面硬件监控浮窗（C# WinForms，**单文件 exe**）。源码�
 - 反射注入 `st`（`Settings.Load()`，只读）、`temp`（`Ready=true` + 手写 `Cpu`）、`cpuHist`、`lastAlarm`；
 - 每 3 秒（与真实 `tempTimer` 同间隔）改一次 `temp.Cpu` 并反射调用 `CheckAlarm()`。
 
-模拟器源码与用法：`C:\Users\Ray\Documents\DSH常用\_rayradar测试\`（含 `README.md` 与编译命令）。
+模拟器源码与用法：**`tests\`**（**仓库内**，含 `README.md` 与各装置的编译命令；2026-09-20 从工作区 `_rayradar测试\` 迁入）。
 **2026-09-19 实测**：持续升温 → 第 42.1 秒弹窗；瞬时尖峰 → 静默不报。
 
-**其它自测装置（共 4 个，源码 / 编译命令 / 实测结论见 `C:\Users\Ray\Documents\DSH常用\_rayradar测试\README.md`）**：
-`SimMain.cs`（温升报警，免管理员）、`SimEntry.cs`（手机入口开/关，**需管理员**，会真的增删 `netsh portproxy`、跑完自动恢复成「开启」）、
+**自测装置共 4 个，都在 `tests\`**：`SimMain.cs`（温升报警，免管理员）、`SimEntry.cs`（手机入口开/关，**需管理员**，会真的增删 `netsh portproxy`、跑完自动恢复成「开启」）、
 `SimAlert.cs`（拦截弹窗的按钮结构，免管理员、只构造窗体不显示）、`SimKill.cs`（`SetTcpEntry` 切断连接，**需管理员**）。
-编译一律加 `/codepage:65001`（否则中文字面量乱码）；除需要真实温度的装置外**不要**嵌 `/resource:` 那 27 个 DLL。
+编译一律加 `/codepage:65001`（否则中文字面量乱码）；除需要真实温度的装置外**不要**嵌 `/resource:` 那 27 个 DLL；编译产物（`*.exe` / `*.log`）不入库。
 
 ## 6. 深入文档（本机）
 

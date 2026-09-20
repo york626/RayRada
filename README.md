@@ -71,6 +71,9 @@ powershell -ExecutionPolicy Bypass -File .\获取依赖.ps1
 - 编译时会把 `lib\*.dll` 逐个 `/resource:` 嵌进 exe；运行时由 `AppDomain.CurrentDomain.AssemblyResolve` 从自身资源流加载（注册必须在碰到任何 LHM 类型之前）
 - 资源名必须等于 DLL 文件名，否则解析不到
 
+仓库里还带 **4 个注入式自测装置**（`tests\`）：不加热 CPU、不读真实传感器，把合成输入喂进**真实的**报警与入口哨兵逻辑，
+用来验证「温升报警（液冷 vs 游戏尖峰）」「手机入口开/关」「拦截弹窗按钮结构」「强制切断连接」。用法与实测结论见 [`tests/README.md`](tests/README.md)。
+
 ## 目录结构
 
 ```

@@ -55,7 +55,7 @@
 - `LanSentinel` 新增 `LanIp()` / `OpenEntry()` / `CloseEntry()` / `StateText()` / `EntryOpen()`。
 
 **说明**
-- 自测装置：`C:\Users\Ray\Documents\DSH常用\_rayradar测试\SimEntry.cs`（编译命令写在文件头，`/codepage:65001` 防中文乱码；**运行需管理员**，会真的改 netsh portproxy，跑完自动恢复成「开启」）。
+- 自测装置：`tests\SimEntry.cs`（2026-09-20 起随本仓库分发，原在工作区 `_rayradar测试\`；编译命令写在文件头，`/codepage:65001` 防中文乱码；**运行需管理员**，会真的改 netsh portproxy，跑完自动恢复成「开启」）。
   实测 2026-09-20：内网 IP 探测 `192.168.31.101` ✓；关闭 → 转发消失 ✓；重开 → 转发恢复 ✓；重复关闭给出「无需关闭」✓；最终状态 `已开启` ✓。
 
 ## v4.10 — 2026-09-20
