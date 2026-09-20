@@ -50,6 +50,10 @@ Windows 桌面硬件监控浮窗（C# WinForms，**单文件 exe**）。源码�
 模拟器源码与用法：`C:\Users\Ray\Documents\DSH常用\_rayradar测试\`（含 `README.md` 与编译命令）。
 **2026-09-19 实测**：持续升温 → 第 42.1 秒弹窗；瞬时尖峰 → 静默不报。
 
+**入口哨兵的自测装置（v4.11 起）**：同目录 `SimEntry.cs` —— 直接调 `LanSentinel.LanIp()` / `OpenEntry()` / `CloseEntry()` / `StateText()`，
+验证「手机入口」的开/关逻辑（不显示浮窗、不读传感器）。⚠️ 它会**真的**增删 `netsh portproxy`，所以**必须用管理员运行**，
+跑完会自动恢复成「开启」并把过程写进同目录 `sim-entry.log`。编译命令见文件头（记得 `/codepage:65001`，否则中文字面量乱码）。
+
 ## 6. 深入文档（本机）
 
 Ray雷达专题（部署模型、温度源、报警机制、发布通道的坑、界面/流量统计设计）：`C:\Users\Ray\Documents\DSH常用\docs\rayradar.md`。

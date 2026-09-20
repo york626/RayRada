@@ -613,6 +613,108 @@ namespace RayRadar
             catch { return false; }
         }
 
+        // ===== v4.11：手机入口的开/关做进设置窗（雷达本身就是管理员运行，所以不用再点 UAC）=====
+
+        static int RunNetsh(string args, out string output)
+        {
+            output = "";
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo("netsh.exe", args);
+                psi.UseShellExecute = false; psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true; psi.RedirectStandardError = true;
+                System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi);
+                output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                p.WaitForExit(8000);
+                return p.ExitCode;
+            }
+            catch { return -1; }
+        }
+
+        // portproxy 里指定端口的所有转发行（listenaddress, listenport）
+        static List<string[]> EntryRows(int port)
+        {
+            List<string[]> rows = new List<string[]>();
+            string outp;
+            RunNetsh("interface portproxy show v4tov4", out outp);
+            foreach (string line in outp.Split('\n'))
+            {
+                Match mm = Regex.Match(line, @"(\d{1,3}(?:\.\d{1,3}){3})\s+(\d+)\s+(\d{1,3}(?:\.\d{1,3}){3})\s+(\d+)");
+                if (!mm.Success) continue;
+                if (mm.Groups[2].Value != port.ToString()) continue;
+                rows.Add(new string[] { mm.Groups[1].Value, mm.Groups[2].Value });
+            }
+            return rows;
+        }
+
+        // 当前内网 IPv4：优先「有默认网关」的那块网卡（跳过回环与 169.254 自动地址）
+        public static string LanIp()
+        {
+            try
+            {
+                string fallback = "";
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    IPInterfaceProperties props = ni.GetIPProperties();
+                    bool hasGw = (props.GatewayAddresses.Count > 0);
+                    foreach (UnicastIPAddressInformation ua in props.UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) continue;
+                        string s = ua.Address.ToString();
+                        if (s.StartsWith("169.254.")) continue;
+                        if (hasGw) return s;
+                        if (fallback.Length == 0) fallback = s;
+                    }
+                }
+                return fallback;
+            }
+            catch { return ""; }
+        }
+
+        public static bool EntryOpen() { return RefreshEntry() && ListenPort > 0; }
+
+        public static string StateText()
+        {
+            if (!EntryOpen()) return "未开启（手机现在连不上这台电脑）";
+            return "已开启：" + ListenIp + ":" + ListenPort.ToString() + " → 127.0.0.1:3082";
+        }
+
+        // 开：先删掉该端口的旧转发 → 按当前内网 IP 重建 → 确保防火墙放行
+        public static string OpenEntry()
+        {
+            string ip = LanIp();
+            if (ip.Length == 0) return "找不到内网 IP：请先连上路由器（网线或 Wi-Fi）。";
+            string outp;
+            foreach (string[] r in EntryRows(3081)) RunNetsh("interface portproxy delete v4tov4 listenaddress=" + r[0] + " listenport=" + r[1], out outp);
+            int rc = RunNetsh("interface portproxy add v4tov4 listenaddress=" + ip + " listenport=3081 connectaddress=127.0.0.1 connectport=3082", out outp);
+            if (rc != 0)
+            {
+                Log("⚠ 重开手机入口失败（netsh exit " + rc.ToString() + "）：" + outp.Trim());
+                return "开启失败（netsh exit " + rc.ToString() + "）：" + outp.Trim();
+            }
+            string fw;
+            RunNetsh("advfirewall firewall show rule name=\"DSH Web LAN 3081\"", out fw);
+            if (fw.IndexOf("DSH Web LAN 3081") < 0)
+                RunNetsh("advfirewall firewall add rule name=\"DSH Web LAN 3081\" dir=in action=allow protocol=TCP localport=3081 remoteip=localsubnet", out fw);
+            entryCheckedAt = DateTime.MinValue;
+            Log("已重开手机入口（设置窗）：" + ip + ":3081 → 127.0.0.1:3082");
+            return "已开启：" + ip + ":3081 → 127.0.0.1:3082";
+        }
+
+        // 关：删掉该端口的所有转发（等于把入口关掉）
+        public static string CloseEntry()
+        {
+            List<string[]> rows = EntryRows(3081);
+            if (rows.Count == 0) return "入口当前未开启，无需关闭。";
+            string outp;
+            foreach (string[] r in rows) RunNetsh("interface portproxy delete v4tov4 listenaddress=" + r[0] + " listenport=" + r[1], out outp);
+            entryCheckedAt = DateTime.MinValue;
+            Log("已在设置窗关闭手机入口（删掉 " + rows.Count.ToString() + " 条转发）");
+            return "已关闭手机入口（删掉 " + rows.Count.ToString() + " 条转发）。手机现在连不上。";
+        }
+
         [DllImport("iphlpapi.dll")]
         static extern int SendARP(int dest, int src, byte[] mac, ref int len);
 
@@ -1411,6 +1513,37 @@ namespace RayRadar
             };
             scroll.Controls.Add(btnWl);
             y += 30;
+
+            Label lbEntry = new Label();
+            lbEntry.AutoSize = true; lbEntry.Font = new Font("Microsoft YaHei UI", 8f); lbEntry.ForeColor = Color.Gray;
+            lbEntry.Location = new Point(18, y + 4);
+            lbEntry.Text = "入口状态：" + LanSentinel.StateText();
+            scroll.Controls.Add(lbEntry);
+
+            Button btnOpen = new Button();
+            btnOpen.Text = "重开手机入口"; btnOpen.Font = new Font("Microsoft YaHei UI", 8f);
+            btnOpen.Size = new Size(96, 24); btnOpen.Location = new Point(18, y + 24);
+            btnOpen.Click += delegate
+            {
+                string r = LanSentinel.OpenEntry();
+                lbEntry.Text = "入口状态：" + LanSentinel.StateText();
+                MessageBox.Show(r + "\r\n\r\n若手机仍打不开：跑一次『开放手机入口.cmd』（它会同时更新信任栅栏，改完需重启 DSH）。",
+                    "Ray雷达 · 手机入口", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
+            scroll.Controls.Add(btnOpen);
+
+            Button btnClose = new Button();
+            btnClose.Text = "关闭手机入口"; btnClose.Font = new Font("Microsoft YaHei UI", 8f);
+            btnClose.Size = new Size(96, 24); btnClose.Location = new Point(122, y + 24);
+            btnClose.Click += delegate
+            {
+                string r = LanSentinel.CloseEntry();
+                lbEntry.Text = "入口状态：" + LanSentinel.StateText();
+                MessageBox.Show(r, "Ray雷达 · 手机入口", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
+            scroll.Controls.Add(btnClose);
+            y += 54;
+
             Hint2("白名单：逗号分隔的 IP 或 MAC（例 192.168.31.18,82-8B-68-6C-2F-FF）。只有本机开了 3081 转发时才生效；日志 %APPDATA%\\RayRadar\\sentinel.log", 18, y + 2);
             y += 34;
 
