@@ -905,6 +905,7 @@ namespace RayRadar
     {
         public static int Port = 8000;
         static System.Diagnostics.Process proc = null;   // 本程序启动的那个 node（用户在别处手动启动时为 null）
+        static bool userStopped = false;                 // 用户在设置窗点了「停止服务」⇒ 看门狗不要自作主张拉起来
 
         // 网页目录：设置里填了就用填的，留空则用「我的文档\DSH常用\竞彩计算器」
         public static string Dir(Settings st)
@@ -1012,6 +1013,7 @@ namespace RayRadar
                 psi.CreateNoWindow = true;                      // 不弹黑窗口
                 psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
                 proc = System.Diagnostics.Process.Start(psi);
+                userStopped = false;
                 for (int i = 0; i < 25 && !Running(); i++) System.Threading.Thread.Sleep(200);
                 if (Running()) return "已启动：\r\n" + Url();
                 return "启动命令已发出，但端口 " + Port.ToString() + " 没在监听。\r\n（node 启动失败，或该端口被别的程序占用）";
@@ -1023,6 +1025,7 @@ namespace RayRadar
         {
             List<int> pids = ListenerPids();
             if (pids.Count == 0) return "服务器本来就没在运行。";
+            userStopped = true;                          // 用户主动停的，看门狗别再拉起来
             int ok = 0;
             foreach (int pid in pids)
             {
@@ -1052,12 +1055,34 @@ namespace RayRadar
             }
             catch { }
         }
+
+        // ===== v4.16 看门狗：每 30 秒看一眼，进程没了就自动拉起来 =====
+        // 起因（2026-09-24 用户反馈「网页打不开了」）：node 进程可能因外部原因被杀
+        //（实测那次是别的程序清理进程树时把它带走了），而雷达只在启动时拉一次 ⇒ 之后就再也没人管。
+        // 规则：① 开关关着 = 不管；② 用户手动停过 = 不管（不跟用户对着干）；③ 已经在监听 = 不管。
+        public static void Watchdog(Settings st)
+        {
+            try
+            {
+                if (st == null || !st.CalcServer) return;
+                if (userStopped) return;
+                if (proc != null && !proc.HasExited) return;                  // 我们起的那个还活着（零成本判断）
+                if (!File.Exists(ScriptPath(st))) return;
+                if (NodeExe().Length == 0) return;
+                if (proc == null && Running()) return;                        // 别处起的，不去抢
+                bool wasDead = (proc != null && proc.HasExited);
+                proc = null;
+                string r = Start(st);
+                LanSentinel.Log("竞彩计算器服务器（看门狗" + (wasDead ? "·进程已退出" : "") + "）：" + r.Replace("\r\n", " "));
+            }
+            catch { }
+        }
     }
 
     public class RadarForm : Form
     {
         Settings st;
-        System.Windows.Forms.Timer timer, tempTimer;
+        System.Windows.Forms.Timer timer, tempTimer, calcTimer;
         Font fCap, fVal, fNet, fSm;
         double cpuPct = 0, memPct = 0, upK = 0, dnK = 0, rdK = 0, wrK = 0;
         ulong pIdle, pTot;
@@ -1111,6 +1136,9 @@ namespace RayRadar
             pIdle = Native.U(i); pTot = Native.U(k) + Native.U(u);
             timer = new System.Windows.Forms.Timer(); timer.Interval = 1000; timer.Tick += new EventHandler(OnTick); timer.Start();
             tempTimer = new System.Windows.Forms.Timer(); tempTimer.Interval = 3000; tempTimer.Tick += new EventHandler(OnTempTick); tempTimer.Start();
+            // v4.16：竞彩计算器服务器看门狗（30 秒一次；核心判断不 spawn 进程，开销可忽略）
+            calcTimer = new System.Windows.Forms.Timer(); calcTimer.Interval = 30000;
+            calcTimer.Tick += delegate { CalcServer.Watchdog(st); }; calcTimer.Start();
             Shown += delegate
             {
                 ApplyTopMost(); OnTempTick(null, null);
@@ -1873,7 +1901,7 @@ namespace RayRadar
             scroll.Controls.Add(btnCalcOff);
             y += 54;
 
-            Hint2("网页目录：留空则用『我的文档\\DSH常用\\竞彩计算器』（该目录需含 index.html 与 serve.mjs）。手机连同一 Wi-Fi 打开状态行里的网址即可；赔率与开奖由手机直接向竞彩官网取，本服务器只发网页、不转发数据。", 18, y + 2);
+            Hint2("网页目录：留空则用『我的文档\\DSH常用\\竞彩计算器』（该目录需含 index.html 与 serve.mjs）。手机连同一 Wi-Fi 打开状态行里的网址即可；赔率与开奖由手机直接向竞彩官网取，本服务器只发网页、不转发数据。v4.16 起带看门狗：进程意外退出会自动拉起（你自己点过「停止服务」则不再自动拉）。", 18, y + 2);
             y += 34;
 
             y = Toggle("开机自启", y, st.AutoStart, delegate(bool v) { st.AutoStart = v; Settings.ApplyAutoStart(v); });

@@ -74,6 +74,29 @@ static class SimCalc
             r2.Replace("\r\n", " ").Substring(0, Math.Min(30, r2.Length)));
         Chk(CalcServer.StateText(bad).IndexOf("未找到网页文件") >= 0, "目录不存在时状态行也说明白", "");
 
+        // ===== v4.16 看门狗 =====
+        Console.WriteLine();
+        Console.WriteLine("--- 看门狗 ---");
+        int killed = 0;
+        foreach (int pid in CalcServer.ListenerPids())          // 模拟「进程被外部杀掉」
+        {
+            try { System.Diagnostics.Process.GetProcessById(pid).Kill(); killed++; } catch { }
+        }
+        System.Threading.Thread.Sleep(1200);
+        Chk(killed > 0 && !CalcServer.Running(), "已模拟进程意外退出", "杀掉 " + killed + " 个");
+
+        CalcServer.Watchdog(st);                                // 雷达每 30 秒会调它
+        System.Threading.Thread.Sleep(1200);
+        Chk(CalcServer.Running(), "看门狗把服务器自动拉了起来", CalcServer.Url());
+
+        CalcServer.Stop();                                      // 用户手动停
+        CalcServer.Watchdog(st);                                // 看门狗不应该跟用户对着干
+        System.Threading.Thread.Sleep(1200);
+        Chk(!CalcServer.Running(), "用户手动停止后，看门狗不自动拉起", "");
+
+        CalcServer.Start(st);                                   // 恢复运行（供后面 keep / 收尾）
+        System.Threading.Thread.Sleep(800);
+
         if (args.Length > 0 && args[0] == "keep")
         {
             Console.WriteLine();
