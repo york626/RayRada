@@ -1,6 +1,6 @@
-# `tests\` —— Ray雷达的注入式自测装置（4 个）
+# `tests\` —— Ray雷达的注入式自测装置（5 个）
 
-> 建立 **2026-09-19**，扩充于 **2026-09-20**。共同特点：**不加热 CPU、不读真实传感器、不改用户设置**，
+> 建立 **2026-09-19**，扩充于 **2026-09-20** / **2026-09-24**。共同特点：**不加热 CPU、不读真实传感器、不改用户设置**，
 > 把「合成输入」喂进**真实的** Ray雷达代码，观察行为是否符合设计。编译产物（`*.exe` / `*.log`）**跑完即删**，只留源码。
 
 | 装置 | 验什么 | 要管理员？ | 会不会动系统 |
@@ -9,13 +9,14 @@
 | `SimEntry.cs` | **手机入口 开/关**（`LanSentinel.LanIp/OpenEntry/CloseEntry/StateText`） | 是 | **会真的改 `netsh portproxy`**（跑完自动恢复成「开启」） |
 | `SimAlert.cs` | **拦截弹窗结构**（按钮文字/个数/回车默认键） | 否 | 否（只构造窗体，不显示、不点击） |
 | `SimKill.cs` | **切断连接**（`SetTcpEntry` 能否断开已建立的 TCP） | 是 | 只切断自己刚建的那条测试连接 |
+| `SimCalc.cs` | **竞彩计算器服务器**（`CalcServer` 起停与状态） | 否 | **会真的起停 8000 端口上的 node**（跑完自动停） |
 
 ## 通用编译方法
 
 ```powershell
 $ws  = 'C:\Tool\RayRadar\tests'
 $csc = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"   # .NET Framework 4.x 自带，C# 5
-# 把 /main: 换成上表对应的类名即可（SimMain / SimEntry / SimAlert / SimKill）
+# 把 /main: 换成上表对应的类名即可（SimMain / SimEntry / SimAlert / SimKill / SimCalc）
 & $csc /nologo /target:exe /main:SimEntry /codepage:65001 /out:"$ws\sim-entry.exe" `
   'C:\Tool\RayRadar\RayRadar.cs' "$ws\SimEntry.cs" `
   '/reference:C:\Tool\RayRadar\lib\LibreHardwareMonitorLib.dll' `
@@ -50,6 +51,16 @@ sim-entry.exe scan     # 只跑白名单匹配（入口已开着即可，**不�
 ### `SimKill`（切断连接，2026-09-20）
 连一条到 `入口:3081` 的 TCP → 调 `LanSentinel.KillConnections(ip, 3081)` → 再通信应报
 「远程主机强迫关闭了一个现有的连接」✓（`SetTcpEntry` + `MIB_TCP_STATE_DELETE_TCB`，需管理员）。
+
+### `SimCalc`（竞彩计算器服务器，2026-09-24）
+```powershell
+sim-calc.exe          # 状态 → 启动 → HTTP 取首页 → 目录填错的报错 → 停止
+sim-calc.exe keep     # 跑完不停止（留给雷达接管）
+```
+实测**全部通过**：默认目录解析成 `我的文档\DSH常用\竞彩计算器` ✓；找到 `serve.mjs` 与 `node.exe` ✓；
+启动后 8000 端口在监听 ✓；**HTTP 真取到首页 78,344 字符且含 `webapi.sporttery.cn`** ✓；
+把 `CalcDir` 指到不存在的目录 → `Start()` 返回「找不到网页文件：…」且状态行同步说明 ✓；`Stop()` 后端口释放 ✓。
+（不需要管理员。真机端到端另测：重启雷达后 **4 秒内**自动拉起服务器，`http://192.168.31.101:8000/` 返回 HTTP 200。）
 
 ## 相关文档
 

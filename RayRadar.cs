@@ -218,6 +218,10 @@ namespace RayRadar
         public bool Sentinel = true;             // 总开关（默认开；没有 3081 入口时等于不做事）
         public bool SentinelSelf = true;         // 放行本机自测连接（自测拦截效果时可临时关掉）
         public string SentinelWhitelist = "";    // 逗号分隔的 IP/MAC（MAC 写法 82-8B-68-6C-2F-FF）
+        // v4.15「竞彩计算器服务器」：把竞彩计算器的本地 node 静态服务器并进雷达管理
+        // （雷达由计划任务开机自启 ⇒ 勾上就等于开机自启，而且全程免 UAC、不弹黑窗口）
+        public bool CalcServer = true;           // 随雷达一起启动
+        public string CalcDir = "";              // 网页目录；留空 = 我的文档\DSH常用\竞彩计算器
 
         public static string DirPath { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RayRadar"); } }
         public static string FilePath { get { return Path.Combine(DirPath, "settings.ini"); } }
@@ -272,6 +276,8 @@ namespace RayRadar
                         case "Sentinel": s.Sentinel = b; break;
                         case "SentinelSelf": s.SentinelSelf = b; break;
                         case "SentinelWhitelist": s.SentinelWhitelist = v; break;
+                        case "CalcServer": s.CalcServer = b; break;
+                        case "CalcDir": s.CalcDir = v; break;
                     }
                 }
             }
@@ -296,6 +302,7 @@ namespace RayRadar
                 ab("AutoStart", AutoStart); ab("DriverAsk", DriverAsk);
                 ab("CollapseTemps", CollapseTemps); L.Add("MainTemp=" + MainTemp);
                 ab("Sentinel", Sentinel); ab("SentinelSelf", SentinelSelf); L.Add("SentinelWhitelist=" + SentinelWhitelist);
+                ab("CalcServer", CalcServer); L.Add("CalcDir=" + CalcDir);
                 File.WriteAllLines(FilePath, L.ToArray());
             }
             catch { }
@@ -889,6 +896,164 @@ namespace RayRadar
         }
     }
 
+    // ===== v4.15：竞彩计算器本地服务器 =====
+    // 竞彩计算器 = 一个单文件网页（index.html）+ 一个零依赖的 node 静态服务器（serve.mjs）。
+    // 以前靠黑窗口或开机自启脚本，现在并进雷达统一托管：设置窗一个开关 + 启动/停止按钮 + 状态行。
+    // 雷达本身以管理员运行、由计划任务开机自启 ⇒ 这个服务器跟着开机自启，且起停都不弹 UAC。
+    // 服务器只监听本机端口（局域网可访问），**不转发任何数据**：赔率/开奖都是手机直接找竞彩官网取。
+    public static class CalcServer
+    {
+        public static int Port = 8000;
+        static System.Diagnostics.Process proc = null;   // 本程序启动的那个 node（用户在别处手动启动时为 null）
+
+        // 网页目录：设置里填了就用填的，留空则用「我的文档\DSH常用\竞彩计算器」
+        public static string Dir(Settings st)
+        {
+            if (st != null && st.CalcDir != null && st.CalcDir.Trim().Length > 0) return st.CalcDir.Trim();
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                                Path.Combine("DSH常用", "竞彩计算器"));
+        }
+        public static string ScriptPath(Settings st) { return Path.Combine(Dir(st), "serve.mjs"); }
+
+        // node.exe：先看几个常见安装位置，再退回 PATH 里的 where node
+        public static string NodeExe()
+        {
+            string[] cand = new string[] {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @"nodejs\node.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"nodejs\node.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\nodejs\node.exe")
+            };
+            foreach (string c in cand) { try { if (File.Exists(c)) return c; } catch { } }
+            try
+            {
+                string outp;
+                if (Run("where.exe", "node", out outp) == 0)
+                    foreach (string line in outp.Split('\n'))
+                    {
+                        string t = line.Trim();
+                        if (t.Length > 3 && File.Exists(t)) return t;
+                    }
+            }
+            catch { }
+            return "";
+        }
+
+        // 通用命令执行（照 LanSentinel.RunNetsh 的写法，只是命令名可变）
+        static int Run(string exe, string args, out string output)
+        {
+            output = "";
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo(exe, args);
+                psi.UseShellExecute = false; psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true; psi.RedirectStandardError = true;
+                System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi);
+                output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                p.WaitForExit(8000);
+                return p.ExitCode;
+            }
+            catch { return -1; }
+        }
+
+        // 监听该端口的进程 PID（netstat 才给 PID，netsh 不给）
+        public static List<int> ListenerPids()
+        {
+            List<int> r = new List<int>();
+            string outp;
+            Run("netstat.exe", "-ano", out outp);
+            if (outp.Length == 0) return r;
+            foreach (string line in outp.Split('\n'))
+            {
+                string t = line.Trim();
+                if (t.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                string[] parts = t.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 5) continue;
+                string local = parts[1];
+                int c = local.LastIndexOf(':');
+                if (c < 0) continue;
+                int p;
+                if (!int.TryParse(local.Substring(c + 1), out p) || p != Port) continue;
+                int pid;
+                if (int.TryParse(parts[parts.Length - 1], out pid) && pid > 0) r.Add(pid);
+            }
+            return r;
+        }
+
+        public static bool Running() { return ListenerPids().Count > 0; }
+
+        public static string Url()
+        {
+            string ip = LanSentinel.LanIp();
+            if (ip.Length == 0) ip = "127.0.0.1";
+            return "http://" + ip + ":" + Port.ToString() + "/";
+        }
+
+        public static string StateText(Settings st)
+        {
+            if (!File.Exists(ScriptPath(st))) return "未找到网页文件（" + ScriptPath(st) + "）";
+            if (NodeExe().Length == 0) return "未找到 node.exe（请先安装 Node.js）";
+            if (!Running()) return "未运行（手机现在打不开计算器）";
+            return "运行中：" + Url();
+        }
+
+        public static string Start(Settings st)
+        {
+            string script = ScriptPath(st);
+            if (!File.Exists(script))
+                return "找不到网页文件：\r\n" + script + "\r\n\r\n该目录里应有 index.html 与 serve.mjs。";
+            string node = NodeExe();
+            if (node.Length == 0) return "找不到 node.exe：请先安装 Node.js（https://nodejs.org）。";
+            if (Running()) return "服务器已经在运行：\r\n" + Url();
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo(node, "\"" + script + "\" " + Port.ToString());
+                psi.WorkingDirectory = Dir(st);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;                      // 不弹黑窗口
+                psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+                proc = System.Diagnostics.Process.Start(psi);
+                for (int i = 0; i < 25 && !Running(); i++) System.Threading.Thread.Sleep(200);
+                if (Running()) return "已启动：\r\n" + Url();
+                return "启动命令已发出，但端口 " + Port.ToString() + " 没在监听。\r\n（node 启动失败，或该端口被别的程序占用）";
+            }
+            catch (Exception ex) { return "启动失败：" + ex.Message; }
+        }
+
+        public static string Stop()
+        {
+            List<int> pids = ListenerPids();
+            if (pids.Count == 0) return "服务器本来就没在运行。";
+            int ok = 0;
+            foreach (int pid in pids)
+            {
+                try { System.Diagnostics.Process.GetProcessById(pid).Kill(); ok++; }
+                catch
+                {
+                    string outp;
+                    Run("taskkill.exe", "/PID " + pid.ToString() + " /F", out outp);
+                    ok++;
+                }
+            }
+            proc = null;
+            for (int i = 0; i < 10 && Running(); i++) System.Threading.Thread.Sleep(200);
+            return Running() ? "停止命令已发出，但端口仍在监听（可能有别的程序占着）。"
+                             : "已停止（关闭 " + ok.ToString() + " 个进程）。";
+        }
+
+        // 随雷达启动；没勾选就什么都不做。失败只写日志，不打扰用户。
+        public static void AutoStart(Settings st)
+        {
+            if (st == null || !st.CalcServer) return;
+            try
+            {
+                if (!File.Exists(ScriptPath(st))) { LanSentinel.Log("竞彩计算器服务器：未启用（找不到 " + ScriptPath(st) + "）"); return; }
+                string r = Start(st);
+                LanSentinel.Log("竞彩计算器服务器：" + r.Replace("\r\n", " "));
+            }
+            catch { }
+        }
+    }
+
     public class RadarForm : Form
     {
         Settings st;
@@ -951,6 +1116,7 @@ namespace RayRadar
                 ApplyTopMost(); OnTempTick(null, null);
                 LanSentinel.OnHits = OnSentinelHits;   // v4.14：哨兵在后台线程扫描，命中后切回 UI 线程弹窗
                 LanSentinel.StartWorker(st);
+                CalcServer.AutoStart(st);              // v4.15：竞彩计算器服务器（没勾选就什么都不做）
             };
             try { Traffic.Load(); } catch { }
             FormClosing += delegate { try { Traffic.Save(); } catch { } HideFlyout(); };
@@ -1666,6 +1832,48 @@ namespace RayRadar
             y += 54;
 
             Hint2("白名单：逗号分隔的 IP 或 MAC（例 192.168.31.18,82-8B-68-6C-2F-FF）。只有本机开了 3081 转发时才生效；日志 %APPDATA%\\RayRadar\\sentinel.log", 18, y + 2);
+            y += 34;
+
+            Lbl("竞彩计算器服务器", 18, y + 4);
+            y += 26;
+            y = Toggle("随雷达一起启动（后台运行，不弹黑窗口）", y, st.CalcServer, delegate(bool v) { st.CalcServer = v; });
+            TextBox tbCalc = new TextBox();
+            tbCalc.Text = st.CalcDir; tbCalc.Font = new Font("Microsoft YaHei UI", 8f);
+            tbCalc.Location = new Point(18, y + 3); tbCalc.Width = 300;
+            tbCalc.TextChanged += delegate { st.CalcDir = tbCalc.Text; };
+            scroll.Controls.Add(tbCalc);
+            y += 30;
+
+            Label lbCalc = new Label();
+            lbCalc.AutoSize = true; lbCalc.Font = new Font("Microsoft YaHei UI", 8f); lbCalc.ForeColor = Color.Gray;
+            lbCalc.Location = new Point(18, y + 4);
+            lbCalc.Text = "服务器状态：" + CalcServer.StateText(st);
+            scroll.Controls.Add(lbCalc);
+
+            Button btnCalcOn = new Button();
+            btnCalcOn.Text = "启动服务"; btnCalcOn.Font = new Font("Microsoft YaHei UI", 8f);
+            btnCalcOn.Size = new Size(96, 24); btnCalcOn.Location = new Point(18, y + 24);
+            btnCalcOn.Click += delegate
+            {
+                string r = CalcServer.Start(st);
+                lbCalc.Text = "服务器状态：" + CalcServer.StateText(st);
+                MessageBox.Show(r, "Ray雷达 · 竞彩计算器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
+            scroll.Controls.Add(btnCalcOn);
+
+            Button btnCalcOff = new Button();
+            btnCalcOff.Text = "停止服务"; btnCalcOff.Font = new Font("Microsoft YaHei UI", 8f);
+            btnCalcOff.Size = new Size(96, 24); btnCalcOff.Location = new Point(122, y + 24);
+            btnCalcOff.Click += delegate
+            {
+                string r = CalcServer.Stop();
+                lbCalc.Text = "服务器状态：" + CalcServer.StateText(st);
+                MessageBox.Show(r, "Ray雷达 · 竞彩计算器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
+            scroll.Controls.Add(btnCalcOff);
+            y += 54;
+
+            Hint2("网页目录：留空则用『我的文档\\DSH常用\\竞彩计算器』（该目录需含 index.html 与 serve.mjs）。手机连同一 Wi-Fi 打开状态行里的网址即可；赔率与开奖由手机直接向竞彩官网取，本服务器只发网页、不转发数据。", 18, y + 2);
             y += 34;
 
             y = Toggle("开机自启", y, st.AutoStart, delegate(bool v) { st.AutoStart = v; Settings.ApplyAutoStart(v); });
