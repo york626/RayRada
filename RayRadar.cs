@@ -1109,6 +1109,7 @@ namespace RayRadar
         const double RiseConfirmSeconds = 20;         // 陡升后复测延时：仍持续升温才报警（区分负载尖峰与液冷故障）
         DateTime risePending = DateTime.MinValue;     // 已测到陡升、等待复测的时刻
         int flushTick = 0;
+        int appTick = 0;                              // v4.17：每 5 秒把按应用增量搬一次（见 OnTick）
 
         public RadarForm(Settings s)
         {
@@ -1147,7 +1148,16 @@ namespace RayRadar
                 CalcServer.AutoStart(st);              // v4.15：竞彩计算器服务器（没勾选就什么都不做）
             };
             try { Traffic.Load(); } catch { }
-            FormClosing += delegate { try { Traffic.Save(); } catch { } HideFlyout(); };
+            // v4.17：按应用流量统计（ETW）。起不来就优雅降级 —— 界面会写明原因，其余功能不受影响。
+            try { AppTraffic.Prune(); } catch { }
+            try { NetMonitor.Start(); } catch { }
+            FormClosing += delegate
+            {
+                try { Traffic.Save(); } catch { }
+                try { AppTraffic.Save(); } catch { }
+                try { NetMonitor.Stop(); } catch { }
+                HideFlyout();
+            };
         }
 
         void OnTempTick(object sender, EventArgs e)
@@ -1437,6 +1447,8 @@ namespace RayRadar
                 if (dRx > 0 || dTx > 0) Traffic.Add(dRx, dTx);
                 if (++flushTick >= 60) { flushTick = 0; try { Traffic.Save(); } catch { } }
             }
+            // v4.17：每 5 秒把 ETW 采集到的「按应用增量」搬进 AppTraffic（重活在 NetMonitor 内部丢线程池）
+            if (++appTick >= 5) { appTick = 0; try { NetMonitor.Tick(); } catch { } }
             pRx = rx; pTx = tx; pTime = now;
             if (st.ShowDisk && diskOk)
             { try { rdK = diskR.NextValue() / 1024.0; wrK = diskW.NextValue() / 1024.0; } catch { diskOk = false; } }
@@ -2166,6 +2178,792 @@ namespace RayRadar
         }
     }
 
+    // ===== 按应用（进程）流量统计（v4.17）=====
+    //
+    // 数据源：**ETW 实时会话**，provider「Microsoft-Windows-Kernel-Network」
+    //   · GUID {7DD42A49-5329-4832-8DFD-43D979153A88}（本机 `logman query providers` 实测）
+    //   · 内核在每次 TCP/UDP 收发时发一个事件：**事件头里带 PID**、载荷里带字节数
+    //     ⇒ 不用抓包、不做「五元组 → PID」映射、不用内核驱动、不用第三方库（任务管理器「网络」列同源）
+    //   · 本机 `wevtutil gp Microsoft-Windows-Kernel-Network` 实测事件号：
+    //       TCPv4 10=发送 / 11=接收　TCPv6 26/27　UDPv4 42/43　UDPv6 58/59
+    //     载荷（IPv4）：PID(4) size(4) 目的地址(4) 源地址(4) 目的端口(2) 源端口(2)
+    //   · 为什么**不用** Npcap / WFP：前者要装驱动 + 用户态逐包解析（常驻浮窗的 CPU 不可接受），
+    //     后者要写内核驱动 + 签名；两者都会破坏「单文件 exe、无驱动、无新依赖」的交付模型。
+    // 硬约束：
+    //   · 起 ETW 会话需要管理员 ⇒ 本程序 manifest 已是 requireAdministrator ✓（普通权限下会优雅降级）
+    //   · ProcessTrace 是**阻塞**调用 ⇒ 必须跑在后台线程（同入口哨兵：放界面线程会冻住浮窗）
+    //   · 只统计**本程序运行期间**的流量（与现有总量口径一致；Windows 的按天历史在 SRUM 里，未采用）
+    //   · **回环（127.x / ::1）不计** —— 现有总量来自网卡计数器、本来就不含回环，这样两边才可比
+    public static class AppTraffic
+    {
+        // 数据目录：%APPDATA%\RayRadar\apptraffic\YYYY-MM-DD.dat，每行「应用名 \t 下行 \t 上行」（TSV）
+        // ⚠️ 按天分文件（不是一个大文件）：一天只有几十~几百行，每 60 秒整写一次也就十几 KB；
+        //    若合成一个大文件，一年 3~4 MB、每分钟重写一遍 ⇒ 每天几个 GB 的无谓磁盘写入。
+        // 可用 RAYRADAR_APPTRAFFIC_DIR 覆盖（自测/演示用，不影响正式数据）
+        public static string DirPath
+        {
+            get
+            {
+                try
+                {
+                    string custom = Environment.GetEnvironmentVariable("RAYRADAR_APPTRAFFIC_DIR");
+                    if (!string.IsNullOrEmpty(custom)) return custom;
+                }
+                catch { }
+                return Path.Combine(Settings.DirPath, "apptraffic");
+            }
+        }
+        public const int KeepDays = 400;        // 保留约 13 个月，够画「最近 1 年」
+
+        static Dictionary<string, Dictionary<string, long[]>> byDay = new Dictionary<string, Dictionary<string, long[]>>();
+        static readonly HashSet<string> dirty = new HashSet<string>();
+        static bool loaded = false;
+
+        public static void Load()
+        {
+            byDay.Clear();
+            dirty.Clear();
+            try
+            {
+                if (Directory.Exists(DirPath))
+                {
+                    string[] files = Directory.GetFiles(DirPath, "*.dat");
+                    Array.Sort(files);
+                    foreach (string f in files)
+                    {
+                        string day = Path.GetFileNameWithoutExtension(f);
+                        if (day.Length != 10) continue;
+                        Dictionary<string, long[]> m = new Dictionary<string, long[]>();
+                        if (ReadInto(f, m) > 0) byDay[day] = m;
+                    }
+                }
+            }
+            catch { }
+            loaded = true;
+        }
+        static void Ensure()
+        {
+            if (!loaded) Load();
+        }
+        static int ReadInto(string path, Dictionary<string, long[]> m)
+        {
+            int n = 0;
+            try
+            {
+                foreach (string line in File.ReadAllLines(path))
+                {
+                    string[] p = line.Split('\t');
+                    if (p.Length < 3 || p[0].Length == 0) continue;
+                    long rx, tx;
+                    if (!long.TryParse(p[1], out rx) || !long.TryParse(p[2], out tx)) continue;
+                    long[] v;
+                    if (!m.TryGetValue(p[0], out v)) { v = new long[2]; m[p[0]] = v; }
+                    v[0] += rx; v[1] += tx; n++;
+                }
+            }
+            catch { }
+            return n;
+        }
+
+        /** 把一批「应用 → [下行,上行]」累加到某一天（由 NetMonitor 每 5 秒调一次） */
+        public static void Add(string day, Dictionary<string, long[]> apps)
+        {
+            Ensure();
+            if (apps == null || apps.Count == 0) return;
+            Dictionary<string, long[]> m;
+            if (!byDay.TryGetValue(day, out m)) { m = new Dictionary<string, long[]>(); byDay[day] = m; }
+            foreach (KeyValuePair<string, long[]> kv in apps)
+            {
+                long[] v;
+                if (!m.TryGetValue(kv.Key, out v)) { v = new long[2]; m[kv.Key] = v; }
+                v[0] += kv.Value[0]; v[1] += kv.Value[1];
+            }
+            dirty.Add(day);
+        }
+
+        /** 落盘：只整写「有改动的那几天」（通常就是今天；跨零点时顺带补写昨天）—— 原子写，写坏不了 */
+        public static void Save()
+        {
+            try
+            {
+                if (dirty.Count == 0) return;
+                Directory.CreateDirectory(DirPath);
+                string[] days = new string[dirty.Count];
+                dirty.CopyTo(days);
+                foreach (string d in days)
+                {
+                    if (WriteDay(d)) dirty.Remove(d);
+                }
+            }
+            catch { }
+        }
+        public static void SaveNow() { Save(); }
+
+        static bool WriteDay(string day)
+        {
+            Dictionary<string, long[]> m;
+            if (!byDay.TryGetValue(day, out m)) return true;
+            try
+            {
+                List<string> keys = new List<string>(m.Keys);
+                keys.Sort(StringComparer.OrdinalIgnoreCase);
+                List<string> lines = new List<string>();
+                foreach (string k in keys)
+                {
+                    long[] v = m[k];
+                    if (v[0] == 0 && v[1] == 0) continue;
+                    lines.Add(k + "\t" + v[0] + "\t" + v[1]);
+                }
+                string path = Path.Combine(DirPath, day + ".dat");
+                string tmp = path + ".tmp";
+                File.WriteAllLines(tmp, lines.ToArray());
+                if (File.Exists(path)) File.Delete(path);
+                File.Move(tmp, path);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /** 裁掉 KeepDays 天以前的历史（按文件名判断，整文件删） */
+        public static void Prune()
+        {
+            try
+            {
+                if (!Directory.Exists(DirPath)) return;
+                DateTime cut = DateTime.Today.AddDays(-KeepDays);
+                foreach (string f in Directory.GetFiles(DirPath, "*.dat"))
+                {
+                    DateTime d;
+                    if (!DateTime.TryParse(Path.GetFileNameWithoutExtension(f), out d)) continue;
+                    if (d.Date < cut) File.Delete(f);
+                }
+            }
+            catch { }
+        }
+
+        /** 最近 backDays 天（含今天）按应用合计，降序（合计相等的按名字排，稳定） */
+        public static List<KeyValuePair<string, long[]>> Rank(int backDays)
+        {
+            Ensure();
+            Dictionary<string, long[]> sum = new Dictionary<string, long[]>();
+            DateTime today = DateTime.Today, from = today.AddDays(-(backDays - 1));
+            foreach (KeyValuePair<string, Dictionary<string, long[]>> kv in byDay)
+            {
+                DateTime d;
+                if (!DateTime.TryParse(kv.Key, out d)) continue;
+                if (d.Date < from || d.Date > today) continue;
+                foreach (KeyValuePair<string, long[]> a in kv.Value)
+                {
+                    long[] v;
+                    if (!sum.TryGetValue(a.Key, out v)) { v = new long[2]; sum[a.Key] = v; }
+                    v[0] += a.Value[0]; v[1] += a.Value[1];
+                }
+            }
+            List<KeyValuePair<string, long[]>> list = new List<KeyValuePair<string, long[]>>(sum);
+            list.Sort(delegate (KeyValuePair<string, long[]> x, KeyValuePair<string, long[]> y)
+            {
+                long bx = x.Value[0] + x.Value[1], by = y.Value[0] + y.Value[1];
+                if (bx != by) return by.CompareTo(bx);
+                return string.Compare(x.Key, y.Key, StringComparison.OrdinalIgnoreCase);
+            });
+            return list;
+        }
+
+        /** 排行取前 topN，其余合并成「其他 N 项」（画横条用，免得尾巴太长） */
+        public static List<KeyValuePair<string, long[]>> RankTop(int backDays, int topN)
+        {
+            List<KeyValuePair<string, long[]>> all = Rank(backDays);
+            if (all.Count <= topN) return all;
+            List<KeyValuePair<string, long[]>> res = new List<KeyValuePair<string, long[]>>();
+            long orx = 0, otx = 0;
+            for (int i = 0; i < all.Count; i++)
+            {
+                if (i < topN) res.Add(all[i]);
+                else { orx += all[i].Value[0]; otx += all[i].Value[1]; }
+            }
+            if (orx + otx > 0) res.Add(new KeyValuePair<string, long[]>("其他 " + (all.Count - topN) + " 项", new long[] { orx, otx }));
+            return res;
+        }
+
+        /** 某个应用的逐日序列（升序，缺的日子补 0）—— 趋势图用 */
+        public static List<KeyValuePair<string, long[]>> AppSeries(string app, int days)
+        {
+            Ensure();
+            List<KeyValuePair<string, long[]>> list = new List<KeyValuePair<string, long[]>>();
+            DateTime today = DateTime.Today;
+            for (int i = days - 1; i >= 0; i--)
+            {
+                string k = today.AddDays(-i).ToString("yyyy-MM-dd");
+                long[] v = DayApp(k, app);
+                list.Add(new KeyValuePair<string, long[]>(k, v));
+            }
+            return list;
+        }
+        /** 某天某应用 */
+        public static long[] DayApp(string day, string app)
+        {
+            Ensure();
+            Dictionary<string, long[]> m;
+            if (byDay.TryGetValue(day, out m))
+            {
+                long[] v;
+                if (m.TryGetValue(app, out v)) return v;
+            }
+            return new long[2];
+        }
+        /** 某天所有应用的合计（用来跟网卡总量对账：按应用合计通常略小） */
+        public static void DayTotal(string day, out long rx, out long tx)
+        {
+            Ensure();
+            rx = 0; tx = 0;
+            Dictionary<string, long[]> m;
+            if (!byDay.TryGetValue(day, out m)) return;
+            foreach (KeyValuePair<string, long[]> kv in m) { rx += kv.Value[0]; tx += kv.Value[1]; }
+        }
+        public static DateTime FirstDay()
+        {
+            Ensure();
+            DateTime first = DateTime.MaxValue;
+            foreach (string k in byDay.Keys)
+            {
+                DateTime d;
+                if (DateTime.TryParse(k, out d) && d < first) first = d;
+            }
+            return first == DateTime.MaxValue ? DateTime.MinValue : first;
+        }
+    }
+
+    /** ETW 采集器：把「进程 → 收发字节」搬到 AppTraffic。采集本身不落盘、不碰界面。 */
+    public static class NetMonitor
+    {
+        const string SessionName = "RayRadarNet";
+        static readonly Guid ProviderGuid = new Guid("7dd42a49-5329-4832-8dfd-43d979153a88");
+
+        const uint EVENT_TRACE_REAL_TIME_MODE = 0x00000100;
+        const uint PROCESS_TRACE_MODE_REAL_TIME = 0x00000100;
+        const uint PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000;
+        const uint EVENT_CONTROL_CODE_ENABLE_PROVIDER = 1;
+        const uint EVENT_TRACE_CONTROL_STOP = 1;
+        const uint WNODE_FLAG_TRACED_GUID = 0x00020000;
+        static readonly Guid SessionGuid = new Guid("5a7c1f42-9d3b-4c88-b1e2-6f0d4a7c9e11");   // 本程序自己的会话 GUID
+
+        static readonly object sync = new object();
+        static Dictionary<int, long[]> pending = new Dictionary<int, long[]>();     // PID → [收, 发]（自上次 Flush）
+        static Dictionary<int, string> nameCache = new Dictionary<int, string>();
+        static Thread worker;
+        static ulong sessionHandle;
+        static IntPtr sessionProps = IntPtr.Zero;
+        // ⚠️ EVENT_TRACE_LOGFILE 必须**自己分配非托管内存、整场会话保活**：
+        //    若写成 `OpenTraceW(ref logfile)` 传托管结构体，marshaller 建的原生副本在调用返回后立刻被释放，
+        //    而 ETW 在 ProcessTrace 期间仍持有那个指针 ⇒ 读已释放内存 ⇒ 0xc0000005 崩溃（2026-09-25 实测踩过：
+        //    sim-etw.exe 启动约 3 秒后 APPCRASH / clr.dll / 0xc0000005）。
+        static IntPtr logfileMem = IntPtr.Zero;
+        static IntPtr loggerNameMem = IntPtr.Zero;
+        static EventRecordCallback callback;        // 回调委托也必须保活：被回收 = 原生回调打到野指针
+        static BufferCallbackThunk bufferCb;        // 同上（缓冲区回调，仅诊断/统计用）
+        static volatile bool running;
+        static volatile string lastError = "";
+        static int busy, saveTick, nameTick;
+
+        /** 采集是否在跑（false 时看 LastError 知道为什么） */
+        public static bool Running { get { return running; } }
+        public static string LastError { get { return lastError; } }
+
+        // ---- 运行诊断（都很便宜：几个计数器 + 有上限的小列表；自测装置与排错时会读）----
+        public static bool DebugCapture = false;    // 打开后记录前 12 条原始事件（排查「PID/字节数读错」用）
+        public static readonly List<string> DebugLines = new List<string>();
+        public static long CallbackCount;           // 记录回调被调用的次数（不管事件号）
+        public static long BufferCallbackCount;     // 缓冲区回调次数
+        public static uint ProcessTraceRc;          // ProcessTrace 的返回码
+        public static int ProcessTraceErr;          // 其 GetLastWin32Error
+        public static long EventCount;              // 收到的事件总数
+        public static long ByteCount;               // 累计字节（收+发）
+        /** 按事件号分项统计 [次数, 字节]（键=事件 ID）—— 排查「某个方向对不上」用 */
+        public static readonly Dictionary<int, long[]> ById = new Dictionary<int, long[]>();
+        /** 被丢弃的事件数：长度不够 / 回环 / PID<=0 / size<=0 */
+        public static long DropLen, DropLoop, DropPid, DropSize;
+        /** 进程名解析失败的记录（最多 10 条）—— 显示成「PID 1234」时看这里 */
+        public static readonly List<string> NameErrors = new List<string>();
+        /** 每个 PID 首次出现的时间与解析结果（最多 40 条） */
+        public static readonly List<string> NameTrace = new List<string>();
+        public static readonly List<string> TraceLog = new List<string>();   // 启动分步进度（定位卡在哪一步）
+        static void T(string s) { try { lock (TraceLog) TraceLog.Add(DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s); } catch { } }
+
+        public static bool Start()
+        {
+            return StartCore(true, SessionName);
+        }
+        /** 诊断/备用：挂到一个**已存在**的会话上（不自己 StartTrace / EnableTrace） */
+        public static bool Attach(string sessionName)
+        {
+            return StartCore(false, sessionName);
+        }
+        static bool StartCore(bool createSession, string sessionName)
+        {
+            if (running) return true;
+            if (worker != null && worker.IsAlive) return false;      // 正在启动/运行
+            string why = LayoutProblem();
+            if (why != null) { lastError = why; return false; }
+            lastError = "";
+            createOwnSession = createSession;
+            sessionToUse = sessionName;
+            worker = new Thread(Worker);
+            worker.IsBackground = true;
+            worker.Name = "RayRadarNetMonitor";
+            worker.Start();
+            for (int i = 0; i < 60 && !running && worker.IsAlive && lastError.Length == 0; i++) Thread.Sleep(50);
+            if (!running && lastError.Length == 0)
+                lastError = "ETW 采集线程提前退出（没报错，可能会话被占用或权限不足）";
+            return running;
+        }
+        static bool createOwnSession = true;
+        static string sessionToUse = SessionName;
+
+        public static void Stop()
+        {
+            try
+            {
+                IntPtr p = AllocProps(SessionName);
+                try { ControlTraceW(0, SessionName, p, EVENT_TRACE_CONTROL_STOP); }
+                finally { Marshal.FreeHGlobal(p); }
+            }
+            catch { }
+            Thread t = worker;
+            if (t != null) { try { t.Join(3000); } catch { } }
+            worker = null;
+            running = false;
+        }
+
+        /**
+         * 由界面那个 1 秒定时器调用（建议每 5 秒一次）：
+         * 把采集到的增量搬进 AppTraffic（每 5 秒）、每 60 秒落一次盘。
+         * ⚠️ 重活丢线程池 —— 解析进程名要走系统调用，别占界面线程。
+         */
+        public static void Tick()
+        {
+            if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
+            ThreadPool.QueueUserWorkItem(delegate (object o)
+            {
+                try
+                {
+                    Flush();
+                    if (++saveTick >= 12) { saveTick = 0; AppTraffic.Save(); }
+                }
+                catch { }
+                finally { Interlocked.Exchange(ref busy, 0); }
+            });
+        }
+
+        /** 把挂起的增量按「应用名」合并后交 AppTraffic */
+        public static void Flush()
+        {
+            Dictionary<int, long[]> snap;
+            lock (sync)
+            {
+                if (pending.Count == 0) return;
+                snap = pending;
+                pending = new Dictionary<int, long[]>();
+                if (++nameTick >= 120) { nameTick = 0; nameCache.Clear(); }   // 每 10 分钟清一次名字缓存（防 PID 复用认错人）
+            }
+            Dictionary<string, long[]> byApp = new Dictionary<string, long[]>();
+            foreach (KeyValuePair<int, long[]> kv in snap)
+            {
+                string app = NameOf(kv.Key);
+                long[] v;
+                if (!byApp.TryGetValue(app, out v)) { v = new long[2]; byApp[app] = v; }
+                v[0] += kv.Value[0]; v[1] += kv.Value[1];
+            }
+            AppTraffic.Add(DateTime.Now.ToString("yyyy-MM-dd"), byApp);
+        }
+
+        static string NameOf(int pid)
+        {
+            lock (sync)
+            {
+                string cached;
+                if (nameCache.TryGetValue(pid, out cached)) return cached;
+            }
+            string n = ResolveName(pid);
+            return n != null ? n : (pid == 0 ? "System Idle" : (pid == 4 ? "System" : "PID " + pid));
+        }
+
+        /** 解析进程名并写缓存；失败返回 null（**不缓存失败**，下次再试） */
+        static string ResolveName(int pid)
+        {
+            string n = null;
+            try { n = System.Diagnostics.Process.GetProcessById(pid).ProcessName; }
+            catch (Exception ex) { if (NameErrors.Count < 10) NameErrors.Add(pid + ": " + ex.GetType().Name + " " + ex.Message); }
+            if (NameTrace.Count < 40)
+            {
+                try
+                {
+                    NameTrace.Add(DateTime.Now.ToString("HH:mm:ss.fff") + "  PID " + pid + " → " +
+                                  (string.IsNullOrEmpty(n) ? "失败" : n));
+                }
+                catch { }
+            }
+            if (string.IsNullOrEmpty(n)) return null;
+            lock (sync) { nameCache[pid] = n; }
+            return n;
+        }
+
+        // ---------- x64 结构体布局自检：不通过就整体降级（宁可不统计，也不乱读内存） ----------
+        // ---------- 布局自检用到的偏移（x64 期望值，全部由 Marshal.OffsetOf 算出后核对）----------
+        public static int OffLoggerName, OffProcessTraceMode, OffCallback, SizeLogfile;      // 8 / 28 / 392 / 416
+        public static int OffPid, OffEventId, OffUserDataLen, OffUserData;                   // 12 / 40 / 86 / 96
+        static string LayoutProblem()
+        {
+            if (IntPtr.Size != 8) return "按应用统计只支持 64 位系统（当前 " + (IntPtr.Size * 8) + " 位）";
+            try
+            {
+                OffLoggerName = (int)Marshal.OffsetOf(typeof(EVENT_TRACE_LOGFILE), "LoggerName");
+                OffProcessTraceMode = (int)Marshal.OffsetOf(typeof(EVENT_TRACE_LOGFILE), "ProcessTraceMode");
+                OffCallback = (int)Marshal.OffsetOf(typeof(EVENT_TRACE_LOGFILE), "EventRecordCallback");
+                OffBufferCallback = (int)Marshal.OffsetOf(typeof(EVENT_TRACE_LOGFILE), "BufferCallback");
+                SizeLogfile = Marshal.SizeOf(typeof(EVENT_TRACE_LOGFILE));
+                OffPid = (int)Marshal.OffsetOf(typeof(EVENT_HEADER), "ProcessId");
+                OffEventId = (int)Marshal.OffsetOf(typeof(EVENT_HEADER), "Id");
+                OffUserDataLen = (int)Marshal.OffsetOf(typeof(EVENT_RECORD), "UserDataLength");
+                OffUserData = (int)Marshal.OffsetOf(typeof(EVENT_RECORD), "UserData");
+
+                string bad = null;
+                if (OffLoggerName != 8) bad = "LoggerName=" + OffLoggerName;
+                else if (OffProcessTraceMode != 28) bad = "ProcessTraceMode=" + OffProcessTraceMode;
+                else if (OffBufferCallback != 400) bad = "缓冲回调偏移=" + OffBufferCallback;
+                else if (OffCallback != 424) bad = "记录回调偏移=" + OffCallback;
+                else if (SizeLogfile != 448) bad = "LOGFILE 大小=" + SizeLogfile;
+                else if (OffPid != 12 || OffEventId != 40) bad = "事件头 PID/ID=" + OffPid + "/" + OffEventId;
+                else if (OffUserDataLen != 86 || OffUserData != 96) bad = "载荷长度/指针=" + OffUserDataLen + "/" + OffUserData;
+                if (bad != null)
+                    return "ETW 结构体布局自检未通过（" + bad + "）⇒ 已停用按应用统计，其余功能不受影响";
+                return null;
+            }
+            catch (Exception ex) { return "ETW 自检异常：" + ex.Message; }
+        }
+
+        static void Worker()
+        {
+            ulong trace = 0;
+            string sess = sessionToUse;
+            try
+            {
+                T("worker 启动（" + (createOwnSession ? "自建会话" : "挂到已有会话") + " " + sess + "）");
+                if (createOwnSession)
+                {
+                    string useName = sess;
+                    sessionProps = AllocProps(useName);
+                    uint rc = StartTraceW(out sessionHandle, useName, sessionProps);
+                    T("StartTraceW(" + useName + ") → " + rc);
+                    if (rc == 183)                // ERROR_ALREADY_EXISTS：上次崩溃留下的同名会话 ⇒ 停掉重来
+                    {
+                        ControlTraceW(0, useName, sessionProps, EVENT_TRACE_CONTROL_STOP);
+                        Thread.Sleep(300);
+                        Marshal.FreeHGlobal(sessionProps);
+                        sessionProps = AllocProps(useName);
+                        rc = StartTraceW(out sessionHandle, useName, sessionProps);
+                        T("同名会话残留，停掉重试 → " + rc);
+                    }
+                    if (rc != 0)
+                    {
+                        lastError = rc == 5 ? "启动 ETW 会话被拒（需要管理员权限）" : "启动 ETW 会话失败（错误 " + rc + "）";
+                        return;
+                    }
+                    sess = useName;
+                    Guid provider = ProviderGuid;      // ⚠️ 静态只读字段不能按 ref 传，得先拷一份局部变量
+                    rc = EnableTraceEx2(sessionHandle, ref provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER, 5,
+                                        0xFFFFFFFFFFFFFFFFUL, 0, 0, IntPtr.Zero);
+                    T("EnableTraceEx2 → " + rc);
+                    if (rc != 0) { lastError = "启用 Kernel-Network provider 失败（错误 " + rc + "）"; return; }
+                }
+
+                // EVENT_TRACE_LOGFILE 建在**非托管内存**里并整场保活（见字段处注释：用 ref 传托管结构体会崩）
+                // ⚠️ 故意**多给 4KB 余量**：ETW 会往这块内存里回写 LogfileHeader 等字段，
+                //    万一真实原生结构体比我们算出来的 416 字节大，多给的余量能兜住（否则就是堆越界 ⇒ 0xC0000409）。
+                callback = new EventRecordCallback(OnRecord);
+                bufferCb = new BufferCallbackThunk(OnBuffer);
+                int alloc = SizeLogfile + 4096;
+                logfileMem = Marshal.AllocHGlobal(alloc);
+                for (int i = 0; i < alloc; i++) Marshal.WriteByte(logfileMem, i, 0);
+                loggerNameMem = Marshal.StringToHGlobalUni(sess);
+                Marshal.WriteIntPtr(logfileMem, OffLoggerName, loggerNameMem);
+                Marshal.WriteInt32(logfileMem, OffProcessTraceMode,
+                                   (int)(PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD));
+                Marshal.WriteIntPtr(logfileMem, OffCallback, Marshal.GetFunctionPointerForDelegate(callback));
+                // 诊断：把回调指针在 368~448 每个 8 字节槽位都写一遍 —— 无论 ETW 真正读哪个偏移都会调到我们，
+                // 从而**反推真实偏移**（正式运行不开）。
+                // 诊断：缓冲区回调也装上（它每收到一个缓冲区就调一次）—— 用来判断「插槽对不对」
+                Marshal.WriteIntPtr(logfileMem, OffBufferCallback, Marshal.GetFunctionPointerForDelegate(bufferCb));
+                trace = OpenTraceW(logfileMem);
+                T("OpenTraceW → " + trace.ToString("X") + "（MaxValue=失败）");
+                if (trace == ulong.MaxValue)
+                {
+                    lastError = "OpenTrace 失败（错误 " + Marshal.GetLastWin32Error() + "）";
+                    return;
+                }
+                running = true;
+                T("开始 ProcessTrace（阻塞）");
+                ProcessTraceRc = ProcessTrace(new ulong[] { trace }, 1, IntPtr.Zero, IntPtr.Zero);   // 阻塞，直到会话被停
+                ProcessTraceErr = Marshal.GetLastWin32Error();
+                T("ProcessTrace 返回 rc=" + ProcessTraceRc + " err=" + ProcessTraceErr +
+                  "，缓冲回调 " + BufferCallbackCount + " 次 / 事件回调 " + CallbackCount + " 次 / 网络事件 " + EventCount + " 条");
+            }
+            catch (Exception ex) { lastError = "ETW 异常：" + ex.Message; T("异常：" + ex.Message); }
+            finally
+            {
+                running = false;
+                try { if (trace != 0 && trace != ulong.MaxValue) CloseTrace(trace); } catch { }
+                try { if (logfileMem != IntPtr.Zero) { Marshal.FreeHGlobal(logfileMem); logfileMem = IntPtr.Zero; } } catch { }
+                try { if (loggerNameMem != IntPtr.Zero) { Marshal.FreeHGlobal(loggerNameMem); loggerNameMem = IntPtr.Zero; } } catch { }
+                try { if (sessionProps != IntPtr.Zero) { Marshal.FreeHGlobal(sessionProps); sessionProps = IntPtr.Zero; } } catch { }
+            }
+        }
+
+        /**
+         * ETW 回调。**每一条事件都走这里，所以要极省**：
+         *   直接按偏移读原生内存（不用 Marshal.PtrToStructure 拆结构体），取值前先查载荷长度。
+         * EVENT_RECORD(x64)：事件头 80 字节；PID 在 12、事件号在 40；
+         *   载荷长度在 86、载荷指针在 96 —— 偏移全部经 LayoutProblem() 自检。
+         */
+        /** 缓冲区回调（诊断/统计）：返回 1 = 继续处理，0 = 停止 */
+        static uint OnBuffer(IntPtr logfile)
+        {
+            try { BufferCallbackCount++; } catch { }
+            return 1;
+        }
+
+        static void OnRecord(IntPtr ptr)
+        {            try
+            {
+                CallbackCount++;
+                ushort id = (ushort)Marshal.ReadInt16(ptr, OffEventId);
+                bool v4, recv, isData;
+                if (id == 10 || id == 42) { v4 = true; recv = false; isData = true; }       // TCPv4/UDPv4 发送
+                else if (id == 11 || id == 43) { v4 = true; recv = true; isData = true; }   // TCPv4/UDPv4 接收
+                else if (id == 26 || id == 58) { v4 = false; recv = false; isData = true; } // IPv6 发送
+                else if (id == 27 || id == 59) { v4 = false; recv = true; isData = true; }  // IPv6 接收
+                else if (id >= 10 && id <= 20) { v4 = true; recv = false; isData = false; } // 连接/断开/重传…（IPv4）
+                else if (id >= 26 && id <= 40) { v4 = false; recv = false; isData = false; }// 同上（IPv6）
+                else if (id >= 42 && id <= 52) { v4 = true; recv = false; isData = false; } // UDP 连接类（IPv4）
+                else if (id >= 58 && id <= 68) { v4 = false; recv = false; isData = false; }// UDP 连接类（IPv6）
+                else return;
+                EventCount++;
+                int len0 = (int)Marshal.ReadInt16(ptr, OffUserDataLen);
+                IntPtr u0 = len0 >= 4 ? Marshal.ReadIntPtr(ptr, OffUserData) : IntPtr.Zero;
+                if (!isData)
+                {
+                    // ★ 非数据事件（连接/断开…）只用来**预热进程名**：连接建立时进程一定还活着，
+                    //   等第一个数据事件再解析就晚了（短命进程已经退出 ⇒ 只能显示「PID 14016」，实测踩过）。
+                    if (u0 != IntPtr.Zero)
+                    {
+                        int pw = Marshal.ReadInt32(u0, 0);
+                        if (pw > 0)
+                        {
+                            bool need;
+                            lock (sync) { need = !nameCache.ContainsKey(pw); }
+                            if (need) ResolveName(pw);
+                        }
+                    }
+                    return;
+                }
+                lock (sync)
+                {
+                    long[] bv;
+                    if (!ById.TryGetValue(id, out bv)) { bv = new long[2]; ById[id] = bv; }
+                    bv[0]++;
+                }
+                int len = len0;
+                if (len < (v4 ? 20 : 44)) { DropLen++; return; }                // ⚠️ 先看长度，再按偏移取
+                IntPtr u = Marshal.ReadIntPtr(ptr, OffUserData);
+                if (u == IntPtr.Zero) { DropLen++; return; }
+                // ⚠️ **PID 要读载荷第 1 个字段，不能读事件头**：内核网络事件的 EVENT_HEADER.ProcessId 恒为 4（System），
+                //    真正的主人（curl / msedge / node…）写在载荷偏移 0（2026-09-25 实测：头PID=4、载荷PID=8516）。
+                //    读错的话所有流量都会算到「System」头上。
+                int pid = Marshal.ReadInt32(u, 0);
+                if (pid <= 0) { DropPid++; return; }
+                // 进程名**第一次见到这个 PID 时就解析**（之后走缓存，零开销）——
+                // 若拖到 Flush 时再解析，短命进程（curl 这种）已经退出，只能显示成「PID 14928」（实测踩过）。
+                bool needName;
+                lock (sync) { needName = !nameCache.ContainsKey(pid); }
+                if (needName) ResolveName(pid);
+                int size = Marshal.ReadInt32(u, 4);                             // 载荷：PID(4) size(4) …
+                if (size <= 0) { DropSize++; return; }
+                // 回环不计（IPv4 地址各 4 字节：目的 8、源 12；IPv6 各 16 字节：目的 8、源 24）
+                if (v4)
+                {
+                    if (Marshal.ReadByte(u, 8) == 127 || Marshal.ReadByte(u, 12) == 127) { DropLoop++; return; }
+                }
+                else
+                {
+                    if (IsV6Loopback(u, 8) || IsV6Loopback(u, 24)) { DropLoop++; return; }
+                }
+                if (DebugCapture && DebugLines.Count < 12)
+                {
+                    DebugLines.Add("id=" + id + " 头PID=" + pid + " 载荷PID=" + Marshal.ReadInt32(u, 0) +
+                                   " size=" + size + " len=" + len + " 头16字节=" + Hex(u, 16));
+                }
+                ByteCount += size;
+                lock (sync) { long[] bv; if (ById.TryGetValue(id, out bv)) bv[1] += size; }
+                lock (sync)
+                {
+                    long[] v;
+                    if (!pending.TryGetValue(pid, out v)) { v = new long[2]; pending[pid] = v; }
+                    v[recv ? 0 : 1] += size;
+                }
+            }
+            catch { }
+        }
+
+        static string Hex(IntPtr p, int n)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < n; i++) sb.Append(Marshal.ReadByte(p, i).ToString("x2"));
+            return sb.ToString();
+        }
+
+        static bool IsV6Loopback(IntPtr u, int off)
+        {
+            for (int i = 0; i < 15; i++) if (Marshal.ReadByte(u, off + i) != 0) return false;
+            return Marshal.ReadByte(u, off + 15) == 1;
+        }
+
+
+        static IntPtr AllocProps(string name)
+        {
+            int size = Marshal.SizeOf(typeof(EVENT_TRACE_PROPERTIES));
+            byte[] nb = Encoding.Unicode.GetBytes(name + "\0");
+            IntPtr p = Marshal.AllocHGlobal(size + nb.Length);
+            for (int i = 0; i < size + nb.Length; i++) Marshal.WriteByte(p, i, 0);
+            EVENT_TRACE_PROPERTIES pr = new EVENT_TRACE_PROPERTIES();
+            pr.Wnode.BufferSize = (uint)(size + nb.Length);
+            // ★ 这三行是「会话建起来但收不到事件」的元凶（2026-09-25 实测：漏了 Flags 时 StartTrace 返回 0、
+            //   EnableTraceEx2 返回 0、OpenTrace 也成功，但**一条事件都不来**）：
+            pr.Wnode.Flags = WNODE_FLAG_TRACED_GUID;   // 0x00020000：告诉 ETW 这个 WNODE 描述的是跟踪会话
+            pr.Wnode.ClientContext = 1;                // 时间戳用 QPC（性能计数器）
+            pr.Wnode.Guid = SessionGuid;               // 固定的会话 GUID（按名字起会话时 ETW 会用它）
+            pr.BufferSize = 64;                  // 每个缓冲区 64KB
+            pr.MinimumBuffers = 4;
+            pr.MaximumBuffers = 16;
+            pr.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+            pr.FlushTimer = 1;                   // 1 秒刷一次 ⇒ 数据够实时
+            Marshal.StructureToPtr(pr, p, false);
+            Marshal.WriteInt32(p, (int)Marshal.OffsetOf(typeof(EVENT_TRACE_PROPERTIES), "LoggerNameOffset"), size);
+            Marshal.WriteInt32(p, (int)Marshal.OffsetOf(typeof(EVENT_TRACE_PROPERTIES), "LogFileNameOffset"), 0);
+            Marshal.Copy(nb, 0, (IntPtr)(p.ToInt64() + size), nb.Length);
+            return p;
+        }
+
+        // ---------- P/Invoke（全部来自 Windows 自带的 advapi32.dll ⇒ 不新增任何文件/依赖） ----------
+        // ⚠️ StartTrace / ControlTrace / OpenTrace 在 DLL 里的**真实导出名带 W 后缀**（StartTraceW …），
+        //    写 ExactSpelling=true 又写不带后缀的名字会报「找不到入口点」（2026-09-25 实测踩过）。
+        [DllImport("advapi32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint StartTraceW(out ulong sessionHandle, string sessionName, IntPtr properties);
+        [DllImport("advapi32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint ControlTraceW(ulong sessionHandle, string sessionName, IntPtr properties, uint controlCode);
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+        static extern uint EnableTraceEx2(ulong traceHandle, ref Guid providerId, uint controlCode, byte level,
+            ulong matchAnyKeyword, ulong matchAllKeyword, uint timeout, IntPtr enableParameters);
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+        static extern ulong OpenTraceW(IntPtr logfile);
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+        static extern uint ProcessTrace(ulong[] handleArray, uint handleCount, IntPtr startTime, IntPtr endTime);
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+        static extern uint CloseTrace(ulong traceHandle);
+
+        delegate void EventRecordCallback(IntPtr eventRecord);
+        /** 缓冲区回调：每收到一个缓冲区调一次（返回 0 继续；仅诊断用，判断回调插槽是否正确） */
+        delegate uint BufferCallbackThunk(IntPtr logfile);
+        public static int OffBufferCallback;        // 应为 368
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct WNODE_HEADER
+        {
+            public uint BufferSize;
+            public uint ProviderId;
+            public ulong HistoricalContext;
+            public long TimeStamp;
+            public Guid Guid;
+            public uint ClientContext;
+            public uint Flags;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct EVENT_TRACE_PROPERTIES
+        {
+            public WNODE_HEADER Wnode;
+            public uint BufferSize;
+            public uint MinimumBuffers;
+            public uint MaximumBuffers;
+            public uint MaximumFileSize;
+            public uint LogFileMode;
+            public uint FlushTimer;
+            public uint EnableFlags;
+            public int AgeLimit;
+            public uint NumberOfBuffers;
+            public uint FreeBuffers;
+            public uint EventsLost;
+            public uint BuffersWritten;
+            public uint LogBuffersLost;
+            public uint RealTimeBuffersLost;
+            public IntPtr LoggerThreadId;
+            public uint LogFileNameOffset;
+            public uint LoggerNameOffset;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct EVENT_HEADER
+        {
+            public ushort Size;
+            public ushort HeaderType;
+            public ushort Flags;
+            public ushort EventProperty;
+            public uint ThreadId;
+            public uint ProcessId;
+            public long TimeStamp;
+            public Guid ProviderId;
+            public ushort Id;
+            public byte Version;
+            public byte Channel;
+            public byte Level;
+            public byte Opcode;
+            public ushort Task;
+            public ulong Keyword;
+            public ulong ProcessorTime;
+            public Guid ActivityId;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct EVENT_RECORD
+        {
+            public EVENT_HEADER EventHeader;
+            public uint BufferContext;
+            public ushort ExtendedDataCount;
+            public ushort UserDataLength;
+            public IntPtr ExtendedData;
+            public IntPtr UserData;
+            public IntPtr UserContext;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct EVENT_TRACE_LOGFILE
+        {
+            // ⚠️ 这个结构体的**后半段偏移与本机 SDK 头文件对不上**，别照抄网上的常量：
+            //    按 C 定义手算出来 BufferCallback=368 / EventRecordCallback=392，
+            //    但本机（Windows 11 + .NET 4.8）实测真值是 **400 / 424**（整段差 +32 字节）。
+            //    怎么测出来的：把「回调指针」在 368~448 每个 8 字节槽位各放一个**独立计数器**，
+            //    跑一次看哪个计数器在涨 —— 只有 400（每缓冲区一次）与 424（每事件一次）有读数。
+            //    ⇒ 中间那段（CurrentEvent + LogfileHeader + 对齐）用不透明字节数组占位，不建模。
+            public IntPtr LogFileName;          // 0
+            public IntPtr LoggerName;           // 8
+            public long CurrentTime;            // 16
+            public uint BuffersRead;            // 24
+            public uint ProcessTraceMode;       // 28
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 368)] public byte[] Opaque;   // 32..400
+            public IntPtr BufferCallback;       // 400 ← 实测
+            public uint BufferSize;             // 408
+            public uint Filled;                 // 412
+            public uint EventsLost;             // 416
+            public IntPtr EventRecordCallback;  // 424 ← 实测（每事件一次）
+            public uint IsKernelTrace;          // 432
+            public IntPtr Context;              // 440
+        }
+    }
+
     // ===== 流量趋势图：手绘堆叠柱状图（下行=蓝，上行=橙），带坐标轴、图例与悬停提示 =====
     public class TrafficChart : Control
     {
@@ -2186,8 +2984,11 @@ namespace RayRadar
             BackColor = Color.White;
         }
         public int Days { get { return days; } }
-        public void SetDays(int d) { days = d; Reload(); }
-        public void Reload() { data = Traffic.RecentAsc(days); hover = -1; Invalidate(); }
+        public void SetDays(int d) { days = d; custom = null; Reload(); }
+        public void Reload() { data = custom != null ? custom : Traffic.RecentAsc(days); hover = -1; Invalidate(); }
+        // v4.17：也可以直接喂一组序列（看「某个应用」的逐日趋势用；传 null 回到总量）
+        List<KeyValuePair<string, long[]>> custom = null;
+        public void SetCustom(List<KeyValuePair<string, long[]>> d) { custom = d; data = d != null ? d : Traffic.RecentAsc(days); hover = -1; Invalidate(); }
 
         Rectangle Plot { get { return new Rectangle(68, 30, Math.Max(20, Width - 68 - 16), Math.Max(20, Height - 30 - 30)); } }
 
@@ -2346,11 +3147,95 @@ namespace RayRadar
     }
 
     // 流量统计窗口（点浮窗上的「网速块」打开）：上=总览卡片，中=柱状图，下=历史明细
+    /** v4.17：应用流量排行（横向堆叠条：下行=蓝、上行=橙）——风格与 TrafficChart 一致 */
+    public class AppRankChart : Control
+    {
+        static readonly Color ColText = Color.FromArgb(80, 84, 92);
+        static readonly Color ColMuted = Color.FromArgb(150, 154, 162);
+        static readonly Color ColTrack = Color.FromArgb(243, 245, 248);
+        List<KeyValuePair<string, long[]>> data = new List<KeyValuePair<string, long[]>>();
+        string empty = "暂无按应用数据";
+
+        public AppRankChart()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Color.White;
+        }
+        public void SetData(List<KeyValuePair<string, long[]>> d, string emptyText)
+        {
+            data = d != null ? d : new List<KeyValuePair<string, long[]>>();
+            if (emptyText != null) empty = emptyText;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            Rectangle box = new Rectangle(0, 0, Width - 1, Height - 1);
+            using (Pen pen = new Pen(Color.FromArgb(230, 233, 238))) g.DrawPath(pen, TrafficChart.RRect(box, 8));
+
+            if (data.Count == 0)
+            {
+                using (Font f = new Font("Microsoft YaHei UI", 9f))
+                using (SolidBrush b = new SolidBrush(ColMuted))
+                    g.DrawString(empty, f, b, 16, 16);
+                return;
+            }
+            long max = 1;
+            foreach (KeyValuePair<string, long[]> kv in data)
+            {
+                long t = kv.Value[0] + kv.Value[1];
+                if (t > max) max = t;
+            }
+            int top = 10, rowH = Math.Max(16, (Height - 20) / Math.Max(1, data.Count));
+            int labelW = 96, valW = 74;
+            using (Font fl = new Font("Microsoft YaHei UI", 8.5f))
+            using (Font fv = new Font("Microsoft YaHei UI", 8f))
+            {
+                for (int i = 0; i < data.Count; i++)
+                {
+                    int y = top + i * rowH;
+                    if (y + rowH > Height - 4) break;
+                    long rx = data[i].Value[0], tx = data[i].Value[1], tot = rx + tx;
+                    int barX = labelW + 6, barW = Math.Max(10, Width - barX - valW);
+                    int full = (int)Math.Round(barW * (double)tot / max); if (full < 2) full = 2;
+                    int downW = tot > 0 ? (int)Math.Round(full * (double)rx / tot) : full;
+                    Rectangle track = new Rectangle(barX, y + 3, barW, rowH - 8);
+                    using (SolidBrush b = new SolidBrush(ColTrack)) g.FillPath(b, TrafficChart.RRect(track, 3));
+                    if (downW > 0)
+                    {
+                        Rectangle rd = new Rectangle(barX, y + 3, downW, rowH - 8);
+                        using (SolidBrush b = new SolidBrush(TrafficChart.ColDown)) g.FillPath(b, TrafficChart.RRect(rd, 3));
+                    }
+                    int upW = full - downW;
+                    if (upW > 0)
+                    {
+                        Rectangle ru = new Rectangle(barX + downW, y + 3, upW, rowH - 8);
+                        using (SolidBrush b = new SolidBrush(TrafficChart.ColUp)) g.FillPath(b, TrafficChart.RRect(ru, 3));
+                    }
+                    System.Windows.Forms.TextRenderer.DrawText(g, data[i].Key, fl,
+                        new Rectangle(12, y, labelW - 6, rowH), ColText,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                    System.Windows.Forms.TextRenderer.DrawText(g, Traffic.Size(tot), fv,
+                        new Rectangle(barX + barW, y, valW - 4, rowH), ColMuted,
+                        TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                }
+            }
+        }
+    }
+
     public class TrafficForm : Form
     {
         TrafficChart chart;
-        DataGridView grid;
-        Button b14, b30;
+        AppRankChart rank;                       // v4.17：应用流量排行
+        DataGridView grid, gridApps;             // 按天明细 / 按应用明细
+        Button b14, b30, r1, r30, r365;
+        ComboBox cbApp;                           // 「流量趋势」看全部还是某个应用
+        TextBox txtSearch;                        // 按应用明细的搜索框
+        Label lbAppStatus;
+        int rankDays = 1;
 
         public TrafficForm()
         {
@@ -2358,7 +3243,7 @@ namespace RayRadar
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(780, 672);
+            ClientSize = new Size(980, 712);
             BackColor = Color.FromArgb(247, 248, 250);
             Font = new Font("Microsoft YaHei UI", 9f);
             TopMost = true;
@@ -2370,7 +3255,7 @@ namespace RayRadar
 
             DateTime first = Traffic.FirstDay();
             Label note = new Label();
-            note.AutoSize = false; note.Size = new Size(560, 20);
+            note.AutoSize = false; note.Size = new Size(940, 20);
             note.ForeColor = Color.FromArgb(140, 144, 152);
             note.Font = new Font("Microsoft YaHei UI", 8.5f);
             note.Text = first == DateTime.MinValue
@@ -2379,59 +3264,77 @@ namespace RayRadar
             note.Location = new Point(22, 40);
             Controls.Add(note);
 
+            // ── v4.17：按应用统计的状态行（采集起不来时把原因写在这里，不让用户猜）──
+            lbAppStatus = new Label();
+            lbAppStatus.AutoSize = false; lbAppStatus.Size = new Size(940, 20);
+            lbAppStatus.ForeColor = Color.FromArgb(140, 144, 152);
+            lbAppStatus.Font = new Font("Microsoft YaHei UI", 8.5f);
+            lbAppStatus.Location = new Point(22, 59);
+            Controls.Add(lbAppStatus);
+
             // ── 总览卡片 ──
             long rx, tx;
             int cx = 20;
-            Traffic.Sum(1, out rx, out tx); Card("今天", "最近 1 天", rx, tx, cx); cx += 250;
-            Traffic.Sum(30, out rx, out tx); Card("最近 30 天", null, rx, tx, cx); cx += 250;
-            Traffic.Sum(365, out rx, out tx); Card("最近 1 年", null, rx, tx, cx);
+            Traffic.Sum(1, out rx, out tx); Card("今天", "最近 1 天", rx, tx, cx, 82); cx += 320;
+            Traffic.Sum(30, out rx, out tx); Card("最近 30 天", null, rx, tx, cx, 82); cx += 320;
+            Traffic.Sum(365, out rx, out tx); Card("最近 1 年", null, rx, tx, cx, 82);
 
-            // ── 图表区 ──
+            // ── 图表区（左：流量趋势 + 应用下拉；右：应用排行）──
             Label lbChart = new Label();
             lbChart.Text = "流量趋势"; lbChart.Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
-            lbChart.ForeColor = Color.FromArgb(40, 44, 52); lbChart.AutoSize = true; lbChart.Location = new Point(20, 184);
+            lbChart.ForeColor = Color.FromArgb(40, 44, 52); lbChart.AutoSize = true; lbChart.Location = new Point(20, 202);
             Controls.Add(lbChart);
 
-            b14 = MkTab("最近 14 天", 552, true);
-            b30 = MkTab("最近 30 天", 646, false);
+            cbApp = new ComboBox();
+            cbApp.DropDownStyle = ComboBoxStyle.DropDownList;
+            cbApp.Font = new Font("Microsoft YaHei UI", 8.5f);
+            cbApp.Location = new Point(96, 199); cbApp.Size = new Size(190, 24);
+            cbApp.SelectedIndexChanged += delegate { RefreshChart(); };
+            Controls.Add(cbApp);
+
+            b14 = MkTab("最近 14 天", 470, 199, 88, true);
+            b30 = MkTab("最近 30 天", 562, 199, 88, false);
             b14.Click += delegate { SetChart(14); };
             b30.Click += delegate { SetChart(30); };
 
             chart = new TrafficChart();
-            chart.Location = new Point(20, 210);
-            chart.Size = new Size(740, 232);
+            chart.Location = new Point(20, 228);
+            chart.Size = new Size(620, 232);
             chart.SetDays(14);
             Controls.Add(chart);
 
-            // ── 历史明细 ──
-            Label lbHist = new Label();
-            lbHist.Text = "历史明细（可滚动）"; lbHist.Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
-            lbHist.ForeColor = Color.FromArgb(40, 44, 52); lbHist.AutoSize = true; lbHist.Location = new Point(20, 450);
-            Controls.Add(lbHist);
+            Label lbRank = new Label();
+            lbRank.Text = "应用流量排行"; lbRank.Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
+            lbRank.ForeColor = Color.FromArgb(40, 44, 52); lbRank.AutoSize = true; lbRank.Location = new Point(660, 202);
+            Controls.Add(lbRank);
+
+            r1 = MkTab("今天", 800, 199, 46, true);
+            r30 = MkTab("30 天", 850, 199, 54, false);
+            r365 = MkTab("1 年", 908, 199, 52, false);
+            r1.Click += delegate { SetRank(1); };
+            r30.Click += delegate { SetRank(30); };
+            r365.Click += delegate { SetRank(365); };
+
+            rank = new AppRankChart();
+            rank.Location = new Point(660, 228);
+            rank.Size = new Size(300, 232);
+            Controls.Add(rank);
+
+            // ── 明细区：两个 Tab（按天 / 按应用）──
+            TabControl tabs = new TabControl();
+            tabs.Location = new Point(20, 470); tabs.Size = new Size(940, 196);
+            tabs.Font = new Font("Microsoft YaHei UI", 9f);
+            Controls.Add(tabs);
+
+            TabPage pDay = new TabPage("按天明细");
+            pDay.BackColor = Color.White; tabs.TabPages.Add(pDay);
+            TabPage pApp = new TabPage("按应用明细（可搜索）");
+            pApp.BackColor = Color.White; tabs.TabPages.Add(pApp);
 
             grid = new DataGridView();
-            grid.Location = new Point(20, 476); grid.Size = new Size(740, 148);
-            grid.ReadOnly = true; grid.AllowUserToAddRows = false; grid.AllowUserToDeleteRows = false;
-            grid.AllowUserToResizeRows = false; grid.RowHeadersVisible = false;
-            grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect; grid.MultiSelect = false;
-            grid.BackgroundColor = Color.White; grid.BorderStyle = BorderStyle.FixedSingle;
-            grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
-            grid.GridColor = Color.FromArgb(238, 240, 243);
-            grid.EnableHeadersVisualStyles = false;
-            grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
-            grid.ColumnHeadersHeight = 30;
-            grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(244, 246, 249);
-            grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(90, 94, 102);
-            grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Bold);
-            grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = Color.FromArgb(244, 246, 249);
-            grid.RowTemplate.Height = 26;
-            grid.DefaultCellStyle.BackColor = Color.White;
-            grid.DefaultCellStyle.ForeColor = Color.FromArgb(60, 64, 72);
-            grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(222, 235, 254);
-            grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(30, 34, 40);
-            grid.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(250, 251, 252);   // 斑马纹
-            grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
-            Controls.Add(grid);
+            grid.Location = new Point(8, 10); grid.Size = new Size(916, 148);
+            MkGrid(grid);
+            pDay.Controls.Add(grid);
             grid.Columns.Add("d", "日期");
             grid.Columns.Add("rx", "下行");
             grid.Columns.Add("tx", "上行");
@@ -2444,6 +3347,31 @@ namespace RayRadar
             grid.ClearSelection();          // 别默认选中第一行
             grid.CurrentCell = null;
 
+            // 搜索框（一年的按应用明细会很长，必须能搜 —— 用户提示里那条说得对）
+            Label lbSearch = new Label();
+            lbSearch.Text = "搜索应用："; lbSearch.AutoSize = true;
+            lbSearch.ForeColor = Color.FromArgb(120, 124, 132); lbSearch.Font = new Font("Microsoft YaHei UI", 8.5f);
+            lbSearch.Location = new Point(10, 14);
+            pApp.Controls.Add(lbSearch);
+            txtSearch = new TextBox();
+            txtSearch.Location = new Point(78, 11); txtSearch.Size = new Size(180, 24);
+            txtSearch.Font = new Font("Microsoft YaHei UI", 9f);
+            txtSearch.TextChanged += delegate { FillAppGrid(); };
+            pApp.Controls.Add(txtSearch);
+
+            gridApps = new DataGridView();
+            gridApps.Location = new Point(8, 42); gridApps.Size = new Size(916, 116);
+            MkGrid(gridApps);
+            pApp.Controls.Add(gridApps);
+            gridApps.Columns.Add("a", "应用");
+            gridApps.Columns.Add("d1", "今天");
+            gridApps.Columns.Add("d30", "最近 30 天");
+            gridApps.Columns.Add("d365", "最近 1 年");
+            gridApps.Columns.Add("all", "合计（1 年）");
+            gridApps.Columns[1].DefaultCellStyle.ForeColor = TrafficChart.ColDown;
+            gridApps.Columns[3].DefaultCellStyle.ForeColor = TrafficChart.ColDown;
+            gridApps.Columns[4].DefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold);
+
             Button ok = new Button();
             ok.Text = "关闭"; ok.Size = new Size(100, 30);
             ok.FlatStyle = FlatStyle.System;
@@ -2451,23 +3379,144 @@ namespace RayRadar
             ok.Click += delegate { Close(); };
             Controls.Add(ok);
             AcceptButton = ok;
+
+            RefreshApps();                  // v4.17：填应用下拉、排行、按应用明细、采集状态
+        }
+
+        // ===== v4.17：按应用相关 =====
+        /** 只给截图装置用：切到某个明细页 */
+        public void SelectTabForShot(int index)
+        {
+            foreach (Control c in Controls)
+            {
+                TabControl t = c as TabControl;
+                if (t != null && index < t.TabPages.Count) { t.SelectedIndex = index; return; }
+            }
+        }
+
+        void SetRank(int d)
+        {
+            rankDays = d;
+            Style(r1, d == 1); Style(r30, d == 30); Style(r365, d == 365);
+            rank.SetData(AppTraffic.RankTop(d, 10), d == 1 ? "今天还没有按应用数据" : "这段时间还没有按应用数据");
         }
 
         void SetChart(int d)
         {
-            chart.SetDays(d);
+            chartDays = d;
             Style(b14, d == 14); Style(b30, d == 30);
+            RefreshChart();
+        }
+        int chartDays = 14;
+
+        /** 趋势图：选「全部应用」看总量，选具体应用看它的逐日曲线 */
+        void RefreshChart()
+        {
+            string app = cbApp.SelectedItem as string;
+            if (string.IsNullOrEmpty(app) || app == AllApps)
+            {
+                chart.SetDays(chartDays);
+                return;
+            }
+            chart.SetCustom(AppTraffic.AppSeries(app, chartDays));
+        }
+        const string AllApps = "全部应用";
+
+        /** 把按应用的数据填进界面（下拉 + 排行 + 明细表 + 状态行） */
+        void RefreshApps()
+        {
+            SuspendLayout();
+            try
+            {
+                // 下拉：全部应用 + 一年内有流量的应用（按用量降序）
+                string keep = cbApp.SelectedItem as string;
+                cbApp.Items.Clear();
+                cbApp.Items.Add(AllApps);
+                foreach (KeyValuePair<string, long[]> kv in AppTraffic.Rank(365))
+                    if (kv.Value[0] + kv.Value[1] > 0) cbApp.Items.Add(kv.Key);
+                int idx = keep != null ? cbApp.Items.IndexOf(keep) : -1;
+                cbApp.SelectedIndex = idx >= 0 ? idx : 0;
+
+                SetRank(rankDays);
+                FillAppGrid();
+
+                lbAppStatus.Text = NetMonitor.Running
+                    ? "按应用统计：运行中（ETW）　·　与上面的总量同口径：只统计 Ray雷达 运行期间；不含纯 ACK 与链路层头，"
+                      + "所以「按应用合计」通常略小于网卡总量；回环(127.0.0.1)不计"
+                    : "按应用统计：未启用" + (NetMonitor.LastError.Length > 0 ? " —— " + NetMonitor.LastError : "");
+            }
+            catch { }
+            ResumeLayout();
         }
 
-        Button MkTab(string text, int x, bool active)
+        /** 按应用明细（带搜索）。三个时间窗各查一次，再合并成一行 */
+        void FillAppGrid()
+        {
+            try
+            {
+                string q = txtSearch != null ? txtSearch.Text.Trim() : "";
+                Dictionary<string, long[]> d1 = ToMap(AppTraffic.Rank(1));
+                Dictionary<string, long[]> d30 = ToMap(AppTraffic.Rank(30));
+                gridApps.Rows.Clear();
+                foreach (KeyValuePair<string, long[]> kv in AppTraffic.Rank(365))
+                {
+                    long tot = kv.Value[0] + kv.Value[1];
+                    if (tot <= 0) continue;
+                    if (q.Length > 0 && kv.Key.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    long[] a = Look(d1, kv.Key), b = Look(d30, kv.Key);
+                    gridApps.Rows.Add(kv.Key, Traffic.Size(a[0] + a[1]), Traffic.Size(b[0] + b[1]),
+                                      Traffic.Size(tot), Traffic.Size(tot));
+                }
+                gridApps.ClearSelection();
+                gridApps.CurrentCell = null;
+            }
+            catch { }
+        }
+        static Dictionary<string, long[]> ToMap(List<KeyValuePair<string, long[]>> list)
+        {
+            Dictionary<string, long[]> m = new Dictionary<string, long[]>();
+            foreach (KeyValuePair<string, long[]> kv in list) m[kv.Key] = kv.Value;
+            return m;
+        }
+        static long[] Look(Dictionary<string, long[]> m, string k)
+        {
+            long[] v;
+            return m.TryGetValue(k, out v) ? v : new long[2];
+        }
+
+        Button MkTab(string text, int x, int y, int w, bool active)
         {
             Button b = new Button();
-            b.Text = text; b.Size = new Size(88, 26); b.Location = new Point(x, 181);
+            b.Text = text; b.Size = new Size(w, 26); b.Location = new Point(x, y);
             b.FlatStyle = FlatStyle.Flat; b.FlatAppearance.BorderSize = 0;
             b.Font = new Font("Microsoft YaHei UI", 8.5f);
             Controls.Add(b);
             Style(b, active);
             return b;
+        }
+        /** DataGridView 的统一外观（两张表共用，免得样式漂移） */
+        static void MkGrid(DataGridView g)
+        {
+            g.ReadOnly = true; g.AllowUserToAddRows = false; g.AllowUserToDeleteRows = false;
+            g.AllowUserToResizeRows = false; g.RowHeadersVisible = false;
+            g.SelectionMode = DataGridViewSelectionMode.FullRowSelect; g.MultiSelect = false;
+            g.BackgroundColor = Color.White; g.BorderStyle = BorderStyle.FixedSingle;
+            g.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+            g.GridColor = Color.FromArgb(238, 240, 243);
+            g.EnableHeadersVisualStyles = false;
+            g.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
+            g.ColumnHeadersHeight = 30;
+            g.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(244, 246, 249);
+            g.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(90, 94, 102);
+            g.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Bold);
+            g.ColumnHeadersDefaultCellStyle.SelectionBackColor = Color.FromArgb(244, 246, 249);
+            g.RowTemplate.Height = 26;
+            g.DefaultCellStyle.BackColor = Color.White;
+            g.DefaultCellStyle.ForeColor = Color.FromArgb(60, 64, 72);
+            g.DefaultCellStyle.SelectionBackColor = Color.FromArgb(222, 235, 254);
+            g.DefaultCellStyle.SelectionForeColor = Color.FromArgb(30, 34, 40);
+            g.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(250, 251, 252);   // 斑马纹
+            g.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         }
         static void Style(Button b, bool active)
         {
@@ -2476,10 +3525,10 @@ namespace RayRadar
         }
 
         // 总览卡片：圆角白底 + 下行(蓝)/上行(橙)/合计
-        void Card(string head, string sub, long rx, long tx, int x)
+        void Card(string head, string sub, long rx, long tx, int x, int y)
         {
             Panel p = new Panel();
-            p.Location = new Point(x, 62); p.Size = new Size(240, 106);
+            p.Location = new Point(x, y); p.Size = new Size(310, 106);
             p.BackColor = Color.White;
             p.Paint += delegate(object s, PaintEventArgs e)
             {
