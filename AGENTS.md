@@ -24,6 +24,9 @@ Windows 桌面硬件监控浮窗（C# WinForms，**单文件 exe**）。源码�
 3. `git add -A; git commit -m "vX.Y: …"`。
 4. 发版：`C:\Users\Ray\.dsh\tools\publish-rayrada.ps1 -Tag vX.Y`
    （本机 `github.com` 被 hosts 拦，脚本走 REST API 推进远端；不带 `-TokenFile` 会用 DPAPI 存好的 token）。
+   ⚠️ **必须在仓库目录内运行**（`cd C:\Tool\RayRadar` 再跑）：脚本会逐文件比对「`git hash-object <文件>` vs 提交里的 blob」，
+   从仓库外运行时 git 会对含 CRLF 的文件套用转换 ⇒ 校验必失败（报「文件与提交不一致」）。同理：**`RayRadar.cs` 保持 LF 换行**，
+   用 PowerShell 做替换时别写进 `` `r`n ``（2026-09-25 踩过：混进 11 处 CRLF，amend 提交才修好）。
 5. ⚠️ **发布后把本地 ref 对齐到远端 SHA**：脚本经 API 建的 commit 会**去掉消息结尾换行**，SHA 与本机 `git commit` 的**差一个字节**
    （脚本打印的「SHA 不同（不影响使用）」是错的——不对齐时，下次提交的 parent 在远端不存在，`POST /git/commits` 会 **422**）。
    做法：去掉本地 commit 对象末尾 `0x0A` → `git hash-object -t commit -w` → `git update-ref refs/heads/main <远端SHA>`；
@@ -54,9 +57,17 @@ Windows 桌面硬件监控浮窗（C# WinForms，**单文件 exe**）。源码�
 模拟器源码与用法：**`tests\`**（**仓库内**，含 `README.md` 与各装置的编译命令；2026-09-20 从工作区 `_rayradar测试\` 迁入）。
 **2026-09-19 实测**：持续升温 → 第 42.1 秒弹窗；瞬时尖峰 → 静默不报。
 
-**自测装置共 4 个，都在 `tests\`**：`SimMain.cs`（温升报警，免管理员）、`SimEntry.cs`（手机入口开/关，**需管理员**，会真的增删 `netsh portproxy`、跑完自动恢复成「开启」）、
-`SimAlert.cs`（拦截弹窗的按钮结构，免管理员、只构造窗体不显示）、`SimKill.cs`（`SetTcpEntry` 切断连接，**需管理员**）。
+**自测装置共 8 个，都在 `tests\`**（清单与逐个用法见 `tests\README.md`）：
+
+- **报警/入口类**：`SimMain.cs`（温升报警，免管理员）、`SimEntry.cs`（手机入口开/关，**需管理员**，会真的增删 `netsh portproxy`、跑完自动恢复成「开启」）、
+  `SimAlert.cs`（拦截弹窗的按钮结构）、`SimKill.cs`（`SetTcpEntry` 切断连接，**需管理员**）。
+- **竞彩计算器 / 服务器类**：`SimCalc.cs`（`CalcServer` 起停与状态）。
+- **v4.17 按应用流量统计**（2026-09-25 新增）：`SimEtw.cs`（**采集端到端，需管理员**：起 ETW 会话、收事件、与网卡计数器对账、按事件号分项、每 PID 的名字解析）、
+  `SimApp.cs`（`AppTraffic` 数据层 19 项断言：聚合/排行/Top-N/时间窗/逐日序列/原子写/裁剪）、`SimShot.cs`（用合成数据把流量窗口画成 PNG 核对版面）。
+
 编译一律加 `/codepage:65001`（否则中文字面量乱码）；除需要真实温度的装置外**不要**嵌 `/resource:` 那 27 个 DLL；编译产物（`*.exe` / `*.log`）不入库。
+⚠️ **跑 ETW 相关装置必须提权**（`StartTrace` 要管理员）；不想每次点 UAC 的话，可临时建一个 `/RL HIGHEST` 的计划任务当入口（**用完删掉**，2026-09-25 是这么迭代的）。
+⚠️ `SimShot` 与 `SimApp` 用环境变量注入合成数据：`RAYRADAR_TRAFFIC_DATA`（总量 TSV）、`RAYRADAR_APPTRAFFIC_DIR`（按应用目录）—— **不碰真实数据**。
 
 ## 6. 深入文档（本机）
 
